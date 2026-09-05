@@ -4221,6 +4221,7 @@ $KimiHomeDir = ""
 if (Test-Path (Join-Path $KimiCodeDir "config.toml")) { $KimiHomeDir = $KimiCodeDir }
 elseif (Test-Path (Join-Path $KimiLegacyDir "config.toml")) { $KimiHomeDir = $KimiLegacyDir }
 elseif (Test-Path $KimiCodeDir) { $KimiHomeDir = $KimiCodeDir }
+elseif (Test-Path $KimiLegacyDir) { $KimiHomeDir = $KimiLegacyDir }
 
 if ((-not $Local) -and $KimiHomeDir) {
     Write-Host ""
