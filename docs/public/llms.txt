@@ -27,6 +27,8 @@ or
 curl -fsSL peonping.com/install | bash
 ```
 
+For Nix/Home Manager, import `inputs.peon-ping.homeManagerModules.default` and set `programs.peon-ping.package = inputs.peon-ping.packages.${pkgs.stdenv.hostPlatform.system}.default`. Adapter scripts live under that package's `share/peon-ping/adapters/`; other IDE hooks remain opt-in.
+
 ## What it does
 
 When your AI agent finishes a task, asks for permission, or hits an error, peon-ping plays a voice line from a game character. The Warcraft orc peon says "Work, work." when a task completes. GLaDOS says "Oh, it's you." when a session starts. Duke Nukem says "Son of a bitch!" when something breaks.
