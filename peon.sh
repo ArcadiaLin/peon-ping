@@ -2025,6 +2025,26 @@ if os.path.isdir(grok_dir):
     else:
         ides.append(('Grok Build', grok_dir, 'detected (not set up)'))
 
+# This Antigravity adapter is a background watcher, so 'installed' here means
+# its daemon is set up to run. Native Antigravity hook registration is separate.
+ag_dir = next(
+    (d for d in (
+        os.environ.get('ANTIGRAVITY_DIR', ''),
+        os.path.join(home, '.gemini', 'antigravity-cli'),
+        os.path.join(home, '.gemini', 'antigravity'),
+        os.path.join(home, '.gemini', 'antigravity-ide'),
+    ) if d and os.path.isdir(d)),
+    None,
+)
+if ag_dir:
+    ag_installed = any(os.path.exists(p) for p in (
+        os.path.join(home, 'Library', 'LaunchAgents',
+                     'com.peonping.antigravity-py-adapter.plist'),
+        os.path.join(claude_hooks_dir, '.antigravity-py-adapter.pid'),
+    ))
+    ides.append(('Antigravity', ag_dir,
+                 'installed' if ag_installed else 'detected (not set up)'))
+
 if ides:
     for name, path, st in ides:
         marker = '[x]' if st == 'installed' else '[ ]'
