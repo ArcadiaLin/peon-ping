@@ -796,7 +796,7 @@ powershell -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser -Executio
 
 ### OpenCode 设置
 
-[OpenCode](https://opencode.ai/) 的原生 TypeScript 插件，完全符合 [CESP v1.0](https://github.com/PeonPing/openpeon) 规范。
+[OpenCode v2](https://opencode.ai/v2/docs/build/plugins) 的轻量 TypeScript 适配器，将事件转发给已安装的 peon-ping 钩子。请先使用平台安装程序安装 peon-ping。
 
 **快速安装：**
 
@@ -804,12 +804,12 @@ powershell -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser -Executio
 curl -fsSL https://raw.githubusercontent.com/PeonPing/peon-ping/main/adapters/opencode.sh | bash
 ```
 
-安装程序将 `peon-ping.ts` 复制到 `~/.config/opencode/plugins/` 并在 `~/.config/opencode/peon-ping/config.json` 创建配置。语音包存储在共享 CESP 路径（`~/.openpeon/packs/`）。
+安装程序遵循 `XDG_CONFIG_HOME`，将 `peon-ping.ts` 复制到 `~/.config/opencode/plugins/`。Windows 用户安装 peon-ping 后，从克隆目录运行 `powershell -NoProfile -File adapters/opencode.ps1`。适配器直接调用 `peon.ps1`，无需 Git Bash。配置、语音包和播放由主 peon-ping 钩子处理。
 
 **功能：**
 
 - **声音播放** — 通过 `afplay`（macOS）、`pw-play`/`paplay`/`ffplay`（Linux）— 与 shell 钩子相同的优先级链
-- **CESP 事件映射** — `session.created` / `session.idle` / `session.error` / `permission.asked` / 快速提示检测都映射到标准 CESP 分类
+- **CESP 事件映射** — 将 v2 的 `session.created`、`session.execution`、`form.created`、`permission.asked` 映射为钩子事件
 - **桌面通知** — 通过 [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) 提供丰富通知（副标题、按项目分组），回退到 `osascript`。仅在终端未获得焦点时触发
 - **终端焦点检测** — 通过 AppleScript 检测你的终端应用（Terminal、iTerm2、Warp、Alacritty、kitty、WezTerm、ghostty、Hyper）是否在最前端
 - **标签页标题** — 更新终端标签页显示任务状态（`● 项目: 工作中...` / `✓ 项目: 完成` / `✗ 项目: 错误`）
@@ -849,7 +849,7 @@ bash ~/.claude/hooks/peon-ping/adapters/opencode/setup-icon.sh
 
 ### Kilo CLI 设置
 
-[Kilo CLI](https://github.com/kilocode/cli) 的原生 TypeScript 插件，完全符合 [CESP v1.0](https://github.com/PeonPing/openpeon) 规范。Kilo CLI 是 OpenCode 的分支，使用相同的插件系统 — 此安装程序下载 OpenCode 插件并为 Kilo 打补丁。
+[Kilo CLI](https://github.com/kilocode/cli) 的原生 TypeScript 插件，完全符合 [CESP v1.0](https://github.com/PeonPing/openpeon) 规范。专用适配器保留 Kilo v1 插件接口，将事件转发给已安装的 peon-ping 钩子。请先使用平台安装程序安装 peon-ping。
 
 **快速安装：**
 
@@ -857,7 +857,7 @@ bash ~/.claude/hooks/peon-ping/adapters/opencode/setup-icon.sh
 curl -fsSL https://raw.githubusercontent.com/PeonPing/peon-ping/main/adapters/kilo.sh | bash
 ```
 
-安装程序将 `peon-ping.ts` 复制到 `~/.config/kilo/plugins/` 并在 `~/.config/kilo/peon-ping/config.json` 创建配置。语音包存储在共享 CESP 路径（`~/.openpeon/packs/`）。
+安装程序遵循 `XDG_CONFIG_HOME`，将专用 Kilo 插件复制到 `~/.config/kilo/plugins/`。播放使用主 peon-ping 安装及其配置。请用 `peon config` 和 `peon packs` 管理设置和语音包。原生 Kilo 会话 ID 会区分独立会话，并在后续事件和插件重新加载时保留相同的语音包身份。
 
 **功能：** 与 [OpenCode 适配器](#opencode-设置)相同 — 声音播放、CESP 事件映射、桌面通知、终端焦点检测、标签页标题、语音包切换、不重复逻辑和刷屏检测。
 

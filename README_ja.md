@@ -769,7 +769,7 @@ peon-ping は `hooks.json` を作成せず、inline hooks を `~/.codex/config.t
 
 ### OpenCode セットアップ
 
-[OpenCode](https://opencode.ai/) 用のネイティブ TypeScript プラグイン。[CESP v1.0](https://github.com/PeonPing/openpeon) に完全準拠。
+[OpenCode v2](https://opencode.ai/v2/docs/build/plugins) 用の薄い TypeScript アダプター。イベントをインストール済みの peon-ping フックに転送します。先にプラットフォーム用の peon-ping インストーラーを実行してください。
 
 **クイックインストール：**
 
@@ -777,12 +777,12 @@ peon-ping は `hooks.json` を作成せず、inline hooks を `~/.codex/config.t
 curl -fsSL https://raw.githubusercontent.com/PeonPing/peon-ping/main/adapters/opencode.sh | bash
 ```
 
-インストーラーは `peon-ping.ts` を `~/.config/opencode/plugins/` にコピーし、`~/.config/opencode/peon-ping/config.json` に設定を作成します。パックは共有 CESP パス（`~/.openpeon/packs/`）に保存されます。
+インストーラーは `XDG_CONFIG_HOME` に従って `peon-ping.ts` を `~/.config/opencode/plugins/` にコピーします。Windows ではクローンから `powershell -NoProfile -File adapters/opencode.ps1` を実行。`peon.ps1` を直接呼び出すため Git Bash は不要です。設定、パック、再生はメインの peon-ping フックが処理します。
 
 **機能：**
 
 - **サウンド再生** — `afplay`（macOS）、`pw-play`/`paplay`/`ffplay`（Linux）経由 — シェルフックと同じ優先チェーン
-- **CESP イベントマッピング** — `session.created` / `session.idle` / `session.error` / `permission.asked` / 高速プロンプト検出がすべて標準 CESP カテゴリにマッピング
+- **CESP イベントマッピング** — v2 の `session.created`、`session.execution`、`form.created`、`permission.asked` をフックイベントにマッピング
 - **デスクトップ通知** — デフォルトで大型オーバーレイバナー（JXA Cocoa、全画面で表示）、または [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) / `osascript` 経由の標準通知。ターミナルがフォーカスされていない場合のみ発火
 - **ターミナルフォーカス検出** — AppleScript でターミナルアプリ（Terminal、iTerm2、Warp、Alacritty、kitty、WezTerm、ghostty、Hyper）が最前面かどうかを確認
 - **タブタイトル** — ターミナルタブにタスクステータスを表示（`● project: working...` / `✓ project: done` / `✗ project: error`）
@@ -822,7 +822,7 @@ bash ~/.claude/hooks/peon-ping/adapters/opencode/setup-icon.sh
 
 ### Kilo CLI セットアップ
 
-[Kilo CLI](https://github.com/kilocode/cli) 用のネイティブ TypeScript プラグイン。[CESP v1.0](https://github.com/PeonPing/openpeon) に完全準拠。Kilo CLI は OpenCode のフォークで同じプラグインシステムを使用 — このインストーラーは OpenCode プラグインをダウンロードして Kilo 用にパッチします。
+[Kilo CLI](https://github.com/kilocode/cli) 用のネイティブ TypeScript プラグイン。[CESP v1.0](https://github.com/PeonPing/openpeon) に完全準拠。Kilo の v1 プラグイン形式を維持する専用アダプターで、イベントをインストール済みの peon-ping フックに転送します。先にプラットフォーム用の peon-ping インストーラーを実行してください。
 
 **クイックインストール：**
 
@@ -830,7 +830,7 @@ bash ~/.claude/hooks/peon-ping/adapters/opencode/setup-icon.sh
 curl -fsSL https://raw.githubusercontent.com/PeonPing/peon-ping/main/adapters/kilo.sh | bash
 ```
 
-インストーラーは `peon-ping.ts` を `~/.config/kilo/plugins/` にコピーし、`~/.config/kilo/peon-ping/config.json` に設定を作成します。パックは共有 CESP パス（`~/.openpeon/packs/`）に保存されます。
+インストーラーは `XDG_CONFIG_HOME` に従って専用の Kilo プラグインを `~/.config/kilo/plugins/` にコピーします。再生にはメインの peon-ping インストールとその設定を使用します。設定とパックは `peon config`、`peon packs` で管理してください。Kilo のネイティブセッション ID を使用するため、独立したセッションは区別され、後続イベントやプラグインの再読み込みでもパックの識別情報が維持されます。
 
 **機能:** [OpenCode アダプター](#opencode-セットアップ)と同じ — サウンド再生、CESP イベントマッピング、デスクトップ通知、ターミナルフォーカス検出、タブタイトル、パック切り替え、リピート防止ロジック、スパム検出。
 
