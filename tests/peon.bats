@@ -6890,3 +6890,30 @@ EOF
   [ "$status" -eq 1 ]
   [[ "$output" == *"not found"* ]]
 }
+
+# ============================================================
+# The main Python block must not import from the temp directory
+# ============================================================
+
+# The block is written to a mktemp file and run by path, and Python prepends a
+# script's own directory to sys.path. That made $TMPDIR an import location on
+# every hook event: Python listed the whole directory at startup (on a Mac
+# whose $TMPDIR held 355k leaked entries, every hook call hung in
+# getdirentries64 and froze the agent sessions waiting on it), and any stray
+# json.py or random.py there was imported in place of the stdlib.
+@test "main python block never imports modules from TMPDIR" {
+  local hostile="$TEST_DIR/hostile-tmp"
+  mkdir -p "$hostile"
+  cat > "$hostile/shlex.py" <<PY
+open("$TEST_DIR/hijacked", "w").write("imported from TMPDIR")
+# Hand over to the real module so a regression fails on the marker, not a hang.
+import sys, os, sysconfig, importlib.util
+_s = importlib.util.spec_from_file_location("shlex", os.path.join(sysconfig.get_paths()["stdlib"], "shlex.py"))
+_m = importlib.util.module_from_spec(_s); _s.loader.exec_module(_m)
+sys.modules["shlex"] = _m; globals().update({k: v for k, v in vars(_m).items() if not k.startswith("__")})
+PY
+  TMPDIR="$hostile" run_peon '{"hook_event_name":"SessionStart","cwd":"/tmp/myproject","session_id":"s1","permission_mode":"default"}'
+  [ "$PEON_EXIT" -eq 0 ]
+  [ ! -f "$TEST_DIR/hijacked" ]
+  afplay_was_called
+}

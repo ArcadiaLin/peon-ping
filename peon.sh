@@ -6658,7 +6658,13 @@ if _auto_debug:
 PEON_LOCAL_PY_EOF
 # Stderr intentionally NOT suppressed: silent failures here masked issue #488
 # for multiple releases. Any future exec error will surface in `peon debug`.
-_PEON_PYOUT=$(python3 "$_PEON_PY_TMP" <<< "$INPUT")
+# -I (isolated): the script lives in $TMPDIR, and Python otherwise prepends a
+# script's own directory to sys.path. That made $TMPDIR an import location on
+# every event: Python listed the whole directory at startup (355k leaked
+# entries hung every hook call in getdirentries64 and froze the agent waiting
+# on it), and a stray json.py or shlex.py there replaced the stdlib module.
+# Config arrives through PEON_ENV_* and stdin, which -I leaves alone.
+_PEON_PYOUT=$(python3 -I "$_PEON_PY_TMP" <<< "$INPUT")
 eval "$_PEON_PYOUT"
 
 # --- Override PROJECT with cmux workspace title ---
