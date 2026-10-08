@@ -213,26 +213,27 @@ _remove_codex_hooks() {
 # Remove the managed [[hooks]] block peon-ping registers in Kimi Code's config
 # (~/.kimi-code, or ~/.kimi for the older kimi-cli). Left behind, Kimi would run
 # a deleted adapter once per event. The adapter owns the block, so hand the work
-# to it and only strip the markers ourselves if it is already gone.
+# to it, and stop rather than guess at the block if it is already gone.
 _remove_kimi_hooks() {
   local kimi_adapter="$INSTALL_DIR/adapters/kimi.sh"
   local kimi_marker="# peon-ping Kimi hooks begin"
-  local kimi_config tmp
+  local kimi_config
   local had_block=false
 
   for kimi_config in "$HOME/.kimi-code/config.toml" "$HOME/.kimi/config.toml"; do
     [ -f "$kimi_config" ] || continue
     grep -qF "$kimi_marker" "$kimi_config" || continue
     had_block=true
-    if [ -f "$kimi_adapter" ]; then
-      KIMI_CONFIG="$kimi_config" bash "$kimi_adapter" --uninstall >/dev/null 2>&1 || true
-    else
-      tmp="$(mktemp)"
-      awk '
-        index($0, "# peon-ping Kimi hooks begin") == 1 { skip = 1; next }
-        index($0, "# peon-ping Kimi hooks end") == 1   { skip = 0; next }
-        !skip { print }
-      ' "$kimi_config" > "$tmp" && mv "$tmp" "$kimi_config"
+    if [ ! -f "$kimi_adapter" ]; then
+      # Only the adapter knows which separator and EOF newline it added, so
+      # stripping the markers here would leave the config changed.
+      echo "Error: cannot safely remove Kimi Code hooks from $kimi_config because adapters/kimi.sh is missing"
+      echo "Re-run the peon-ping installer to restore the adapter, then uninstall again."
+      return 1
+    fi
+    if ! KIMI_CONFIG="$kimi_config" bash "$kimi_adapter" --uninstall >/dev/null; then
+      echo "Error: could not remove Kimi Code hooks from $kimi_config"
+      return 1
     fi
     echo "Removed Kimi Code hooks from $kimi_config"
   done

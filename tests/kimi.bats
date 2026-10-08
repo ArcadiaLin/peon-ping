@@ -180,6 +180,109 @@ event = "PreToolUse"
   [ "$status" -eq 0 ]
 }
 
+# Install twice and uninstall a config seeded with printf-format $1, checking
+# that --install leaves every byte ahead of the block alone and that --uninstall
+# gives back the original file exactly.
+assert_round_trip() {
+  printf "$1" > "$KIMI_CONFIG"
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  head -c "$(wc -c < "$TEST_DIR/config.orig")" "$KIMI_CONFIG" > "$TEST_DIR/config.head"
+  run cmp "$TEST_DIR/config.head" "$TEST_DIR/config.orig"
+  [ "$status" -eq 0 ]
+
+  run_kimi_flag --uninstall
+  [ "$status" -eq 0 ]
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+  [ "$status" -eq 0 ]
+}
+
+@test "--install and --uninstall keep whitespace inside a multiline value" {
+  assert_round_trip 'prompt = """\nfirst\n    \n\t\nlast\n"""\n'
+}
+
+@test "--install and --uninstall keep a config without a final newline" {
+  assert_round_trip 'default_model = "x"'
+}
+
+@test "--install and --uninstall keep a CRLF blank separator" {
+  assert_round_trip 'default_model = "x"\r\n\r\n'
+}
+
+@test "--install and --uninstall keep a CRLF config without a final newline" {
+  assert_round_trip 'a = 1\r\nb = 2'
+}
+
+@test "--install and --uninstall keep mixed line endings" {
+  assert_round_trip 'a = 1\r\nprompt = """\nx\n"""\n'
+}
+
+@test "--install and --uninstall keep several trailing blank lines" {
+  assert_round_trip 'a = 1\n\n\n'
+}
+
+@test "--install and --uninstall keep an empty config empty" {
+  assert_round_trip ''
+}
+
+@test "--install writes the block in the config's own CRLF line endings" {
+  printf 'a = 1\r\n' > "$KIMI_CONFIG"
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  # Every line of the file ends in CRLF.
+  [ "$(grep -c $'\r$' "$KIMI_CONFIG")" -eq "$(wc -l < "$KIMI_CONFIG")" ]
+}
+
+@test "--install records the newline it adds to an unterminated last line" {
+  printf 'a = 1' > "$KIMI_CONFIG"
+  run_kimi_flag --install
+  grep -qxF '# peon-ping Kimi hooks begin (newline added at end of file)' "$KIMI_CONFIG"
+}
+
+@test "--uninstall keeps the added newline when the user wrote after the block" {
+  printf 'a = 1' > "$KIMI_CONFIG"
+  run_kimi_flag --install
+  printf 'b = 2\n' >> "$KIMI_CONFIG"
+  run_kimi_flag --uninstall
+  [ "$status" -eq 0 ]
+  [ "$(cat "$KIMI_CONFIG")" = $'a = 1\nb = 2' ]
+}
+
+@test "--install and --uninstall refuse an unterminated block and leave it alone" {
+  printf 'a = 1\n# peon-ping Kimi hooks begin\nb = 2\n' > "$KIMI_CONFIG"
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+
+  run_kimi_flag --install
+  [ "$status" -ne 0 ]
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+  [ "$status" -eq 0 ]
+
+  run_kimi_flag --uninstall
+  [ "$status" -ne 0 ]
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+  [ "$status" -eq 0 ]
+}
+
+@test "--install and --uninstall keep the config's mode and symlink" {
+  mkdir -p "$TEST_DIR/dotfiles"
+  printf 'a = 1\n' > "$TEST_DIR/dotfiles/kimi.toml"
+  chmod 640 "$TEST_DIR/dotfiles/kimi.toml"
+  ln -s "$TEST_DIR/dotfiles/kimi.toml" "$KIMI_CONFIG"
+
+  run_kimi_flag --install
+  [ -L "$KIMI_CONFIG" ]
+  grep -qF "# peon-ping Kimi hooks begin" "$TEST_DIR/dotfiles/kimi.toml"
+  run_kimi_flag --uninstall
+  [ -L "$KIMI_CONFIG" ]
+  [ "$(cat "$TEST_DIR/dotfiles/kimi.toml")" = "a = 1" ]
+  perms=$(stat -c '%a' "$TEST_DIR/dotfiles/kimi.toml" 2>/dev/null || stat -f '%Lp' "$TEST_DIR/dotfiles/kimi.toml")
+  [ "$perms" = "640" ]
+}
+
 @test "--uninstall on a config without the block reports cleanly" {
   seed_config 'default_model = "x"
 '

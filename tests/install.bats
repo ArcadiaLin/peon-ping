@@ -1138,6 +1138,34 @@ _kimi_test_teardown() {
   _kimi_test_teardown
 }
 
+@test "uninstall restores a Kimi config without a final newline byte for byte" {
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code"
+  printf 'model = "kimi-k2"' > "$TEST_HOME/.kimi-code/config.toml"
+  cp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.orig"
+  bash "$CLONE_DIR/install.sh"
+  grep -qF "# peon-ping Kimi hooks begin" "$TEST_HOME/.kimi-code/config.toml"
+
+  bash "$INSTALL_DIR/uninstall.sh"
+  cmp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.orig"
+  _kimi_test_teardown
+}
+
+@test "uninstall stops instead of guessing at the Kimi block when the adapter is gone" {
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code"
+  printf 'model = "kimi-k2"\n' > "$TEST_HOME/.kimi-code/config.toml"
+  bash "$CLONE_DIR/install.sh"
+  cp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.installed"
+  rm "$INSTALL_DIR/adapters/kimi.sh"
+
+  run bash "$INSTALL_DIR/uninstall.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"adapters/kimi.sh is missing"* ]]
+  cmp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.installed"
+  _kimi_test_teardown
+}
+
 @test "--kimi flag appears in --help output" {
   run bash "$CLONE_DIR/install.sh" --help
   [ "$status" -eq 0 ]

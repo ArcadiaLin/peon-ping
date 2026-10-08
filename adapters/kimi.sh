@@ -60,6 +60,10 @@ KIMI_CONFIG="${KIMI_CONFIG:-$KIMI_DIR/config.toml}"
 
 BEGIN_MARKER="# peon-ping Kimi hooks begin"
 END_MARKER="# peon-ping Kimi hooks end"
+# Appended to the begin marker when --install had to terminate the config's last
+# line before it could add the block, so --uninstall knows to take that newline
+# back. Without it "a" and "a\n" install to the same bytes.
+EOF_NOTE="(newline added at end of file)"
 
 # Leftovers from the watcher daemon this adapter replaced. See
 # stop_legacy_watcher below.
@@ -157,27 +161,53 @@ toml_basic() {
   printf '"%s"' "$escaped"
 }
 
-strip_block() {
-  # Remove a previously installed block, marker lines included. --install writes
-  # exactly one blank separator line ahead of the marker, so take that one back
-  # too -- and only that one, or --uninstall would eat a blank line the config
-  # already had. Blank lines are therefore buffered rather than printed as seen.
-  local file="$1"
-  [ -f "$file" ] || return 0
-  awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
-    index($0, b) == 1 {
-      if (blanks > 0) blanks--
-      for (i = 0; i < blanks; i++) print ""
-      blanks = 0
-      skip = 1
+locate_block() {
+  # Print "<begin> <end> <sep> <eof> <crlf>" for the managed block: the marker
+  # line numbers, whether the line ahead of the begin marker is the blank
+  # separator --install writes, whether the begin marker carries EOF_NOTE, and
+  # whether the block was written with CRLF. "none" if there is no block, "open"
+  # if the begin marker has no end marker after it.
+  awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" -v n="$EOF_NOTE" '
+    !begin && index($0, b) == 1 {
+      begin = NR
+      sep = (NR > 1 && (prev == "" || prev == "\r"))
+      eof = (index($0, n) > 0)
+      crlf = (substr($0, length($0)) == "\r")
       next
     }
-    index($0, e) == 1 { skip = 0; next }
-    skip { next }
-    /^[[:space:]]*$/ { blanks++; next }
-    { for (i = 0; i < blanks; i++) print ""; blanks = 0; print }
-    END { for (i = 0; i < blanks; i++) print "" }
-  ' "$file"
+    begin && index($0, e) == 1 { print begin, NR, sep, eof, crlf; found = 1; exit }
+    { prev = $0 }
+    END { if (!found) print (begin ? "open" : "none") }
+  ' "$1"
+}
+
+strip_block() {
+  # Print the config with the managed block removed, along with the separator
+  # and EOF newline --install added for it, and every other byte untouched.
+  # awk only locates the block; head/tail copy the rest, because re-printing
+  # lines through awk loses whitespace-only lines, CRs and a missing final
+  # newline. Fails on an unterminated block rather than guess where it ends.
+  local file="$1" loc begin end sep eof crlf keep size
+  [ -f "$file" ] || return 0
+  loc="$(locate_block "$file")"
+  case "$loc" in
+    none) cat "$file"; return 0 ;;
+    open) error "$file has \"$BEGIN_MARKER\" without \"$END_MARKER\"; fix it by hand."; return 1 ;;
+  esac
+  read -r begin end sep eof crlf <<< "$loc"
+  keep=$((begin - 1 - sep))
+
+  # Only take the EOF newline back if the block is still last in the file:
+  # anything appended after it needs that newline to stay on its own line.
+  if [ "$eof" = 1 ] && [ "$keep" -gt 0 ] && [ "$(tail -n "+$((end + 1))" "$file" | wc -c)" -eq 0 ]; then
+    size=$(head -n "$keep" "$file" | wc -c)
+    head -n "$keep" "$file" | head -c $((size - 1 - crlf))
+    return 0
+  fi
+  # BSD head rejects -n 0.
+  [ "$keep" -gt 0 ] && head -n "$keep" "$file"
+  tail -n "+$((end + 1))" "$file"
+  return 0
 }
 
 case "${1:-}" in
@@ -219,7 +249,14 @@ EOF
       exit 0
     fi
     tmp="$(mktemp)"
-    strip_block "$KIMI_CONFIG" > "$tmp" && mv "$tmp" "$KIMI_CONFIG"
+    if ! strip_block "$KIMI_CONFIG" > "$tmp"; then
+      rm -f "$tmp"
+      exit 1
+    fi
+    # Write through the existing file rather than mv over it, so its mode,
+    # owner and any symlink survive.
+    cat "$tmp" > "$KIMI_CONFIG"
+    rm -f "$tmp"
     info "Removed peon-ping hooks from $KIMI_CONFIG"
     exit 0
     ;;
@@ -234,22 +271,37 @@ EOF
     HOOK_COMMAND="CLAUDE_PEON_DIR=$(sh_quote "$PEON_DIR") bash $(sh_quote "$ADAPTER")"
     tmp="$(mktemp)"
     # Rewriting from scratch keeps --install idempotent.
-    strip_block "$KIMI_CONFIG" > "$tmp"
+    if ! strip_block "$KIMI_CONFIG" > "$tmp"; then
+      rm -f "$tmp"
+      exit 1
+    fi
+    # Match the config's line endings so a CRLF file stays CRLF.
+    nl=$'\n'
+    LC_ALL=C grep -q $'\r$' "$tmp" && nl=$'\r\n'
+    begin_line="$BEGIN_MARKER"
     {
-      # Separate the block from existing content, but do not open an empty
-      # config with a blank line.
-      [ -s "$tmp" ] && printf '\n'
-      printf '%s\n' "$BEGIN_MARKER"
-      printf '# install_dir = %s\n' "$PEON_DIR"
+      # Separate the block from existing content with one blank line, but do
+      # not open an empty config with one. A last line without a newline has to
+      # be terminated first; EOF_NOTE records that for --uninstall.
+      if [ -s "$tmp" ]; then
+        if [ -n "$(tail -c 1 "$tmp")" ]; then
+          printf '%s' "$nl"
+          begin_line="$BEGIN_MARKER $EOF_NOTE"
+        fi
+        printf '%s' "$nl"
+      fi
+      printf '%s%s' "$begin_line" "$nl"
+      printf '# install_dir = %s%s' "$PEON_DIR" "$nl"
       for ev in "${HOOK_EVENTS[@]}"; do
-        printf '\n[[hooks]]\n'
-        printf 'event = "%s"\n' "$ev"
-        printf 'command = %s\n' "$(toml_basic "$HOOK_COMMAND")"
-        printf 'timeout = 10\n'
+        printf '%s[[hooks]]%s' "$nl" "$nl"
+        printf 'event = "%s"%s' "$ev" "$nl"
+        printf 'command = %s%s' "$(toml_basic "$HOOK_COMMAND")" "$nl"
+        printf 'timeout = 10%s' "$nl"
       done
-      printf '\n%s\n' "$END_MARKER"
+      printf '%s%s%s' "$nl" "$END_MARKER" "$nl"
     } >> "$tmp"
-    mv "$tmp" "$KIMI_CONFIG"
+    cat "$tmp" > "$KIMI_CONFIG"
+    rm -f "$tmp"
 
     info "${BOLD}peon-ping hooks registered for Kimi Code${RESET}"
     printf "  %sconfig:%s  %s\n" "$DIM" "$RESET" "$KIMI_CONFIG"
