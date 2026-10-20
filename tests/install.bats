@@ -1226,6 +1226,44 @@ TOML
   _kimi_test_teardown
 }
 
+@test "uninstall stops before deleting the adapter when the Kimi config cannot be written" {
+  [ "$(id -u)" -ne 0 ] || skip "root ignores file permissions"
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code"
+  printf 'model = "kimi-k2"\n' > "$TEST_HOME/.kimi-code/config.toml"
+  bash "$CLONE_DIR/install.sh"
+  cp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.installed"
+  chmod 444 "$TEST_HOME/.kimi-code/config.toml"
+
+  run bash "$INSTALL_DIR/uninstall.sh"
+  chmod 644 "$TEST_HOME/.kimi-code/config.toml"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not remove Kimi Code hooks"* ]]
+  cmp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.installed"
+  # The hooks still run the adapter, so it has to stay.
+  [ -f "$INSTALL_DIR/adapters/kimi.sh" ]
+  _kimi_test_teardown
+}
+
+@test "uninstall stops before deleting the adapter when the Kimi config cannot be read" {
+  [ "$(id -u)" -ne 0 ] || skip "root ignores file permissions"
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code"
+  printf 'model = "kimi-k2"\n' > "$TEST_HOME/.kimi-code/config.toml"
+  bash "$CLONE_DIR/install.sh"
+  cp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.installed"
+  chmod 000 "$TEST_HOME/.kimi-code/config.toml"
+
+  run bash "$INSTALL_DIR/uninstall.sh"
+  chmod 644 "$TEST_HOME/.kimi-code/config.toml"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot read Kimi config"* ]]
+  cmp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.installed"
+  # The hooks still run the adapter, so it has to stay.
+  [ -f "$INSTALL_DIR/adapters/kimi.sh" ]
+  _kimi_test_teardown
+}
+
 @test "--kimi flag appears in --help output" {
   run bash "$CLONE_DIR/install.sh" --help
   [ "$status" -eq 0 ]

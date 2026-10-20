@@ -245,9 +245,20 @@ _remove_kimi_hooks() {
 
   for kimi_config in "$HOME/.kimi-code/config.toml" "$HOME/.kimi/config.toml"; do
     [ -f "$kimi_config" ] || continue
-    if ! grep -qF "$kimi_marker" "$kimi_config"; then
-      _warn_unmanaged_kimi_hooks "$kimi_config"
-      continue
+    # grep exits 1 for "no block" and 2 when it could not read the config. A
+    # config that may still hold the block must stop the uninstall before the
+    # adapter its hooks run is deleted.
+    if grep -qF "$kimi_marker" "$kimi_config"; then
+      :
+    else
+      local rc=$?
+      if [ "$rc" -eq 1 ]; then
+        _warn_unmanaged_kimi_hooks "$kimi_config"
+        continue
+      fi
+      echo "Error: cannot read Kimi config $kimi_config, so its peon-ping hooks cannot be checked"
+      echo "Fix its permissions, then uninstall again."
+      return 1
     fi
     had_block=true
     if [ ! -f "$kimi_adapter" ]; then

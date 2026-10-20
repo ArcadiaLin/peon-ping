@@ -282,6 +282,71 @@ assert_round_trip() {
   [ "$status" -eq 0 ]
 }
 
+@test "--install and --uninstall fail when the config cannot be written" {
+  # A failed write used to report success and exit 0, after which uninstall.sh
+  # deleted the adapter the hooks still ran.
+  [ "$(id -u)" -ne 0 ] || skip "root ignores file permissions"
+  seed_config 'a = 1'
+  run_kimi_flag --install
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  chmod 444 "$KIMI_CONFIG"
+
+  run_kimi_flag --uninstall
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Could not write"* ]]
+  [[ "$output" != *"Removed peon-ping hooks"* ]]
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  [ "$status" -eq 0 ]
+
+  run_kimi_flag --install
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"registered for"* ]]
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  [ "$status" -eq 0 ]
+  chmod 644 "$KIMI_CONFIG"
+}
+
+@test "--uninstall and --status fail when the config cannot be read" {
+  # grep exits 2, not 1, on a file it cannot read; taking that for "no block"
+  # reported nothing to remove and let uninstall.sh delete the adapter.
+  [ "$(id -u)" -ne 0 ] || skip "root ignores file permissions"
+  seed_config 'a = 1'
+  run_kimi_flag --install
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  chmod 000 "$KIMI_CONFIG"
+
+  run_kimi_flag --uninstall
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Cannot read Kimi config"* ]]
+  [[ "$output" != *"Nothing to remove"* ]]
+
+  run_kimi_flag --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Cannot read Kimi config"* ]]
+
+  chmod 644 "$KIMI_CONFIG"
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  [ "$status" -eq 0 ]
+}
+
+@test "--install refuses a config it cannot read instead of writing over it" {
+  # Readable as empty, it would have been replaced by the block alone.
+  [ "$(id -u)" -ne 0 ] || skip "root ignores file permissions"
+  seed_config 'default_model = "x"
+'
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+  chmod 200 "$KIMI_CONFIG"
+
+  run_kimi_flag --install
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Cannot read Kimi config"* ]]
+  [[ "$output" != *"registered for"* ]]
+
+  chmod 644 "$KIMI_CONFIG"
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+  [ "$status" -eq 0 ]
+}
+
 @test "--install and --uninstall keep the config's mode and symlink" {
   mkdir -p "$TEST_DIR/dotfiles"
   printf 'a = 1\n' > "$TEST_DIR/dotfiles/kimi.toml"

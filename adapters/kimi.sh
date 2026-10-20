@@ -305,7 +305,12 @@ strip_block() {
   # newline. Fails on an unterminated block rather than guess where it ends.
   local file="$1" loc begin end sep eof crlf keep size
   [ -f "$file" ] || return 0
-  loc="$(locate_block "$file")"
+  # An unreadable config must not pass for an empty one: --install would then
+  # write the block over everything the user had.
+  if ! loc="$(locate_block "$file")"; then
+    error "Cannot read Kimi config: $file"
+    return 1
+  fi
   case "$loc" in
     none) cat "$file"; return 0 ;;
     open) error "$file has \"$BEGIN_MARKER\" without \"$END_MARKER\"; fix it by hand."; return 1 ;;
@@ -341,7 +346,17 @@ EOF
     ;;
 
   --status)
-    if [ -f "$KIMI_CONFIG" ] && grep -qF "$BEGIN_MARKER" "$KIMI_CONFIG"; then
+    if [ -f "$KIMI_CONFIG" ]; then
+      grep -qF "$BEGIN_MARKER" "$KIMI_CONFIG"
+      rc=$?
+      if [ "$rc" -gt 1 ]; then
+        error "Cannot read Kimi config: $KIMI_CONFIG"
+        exit 1
+      fi
+    else
+      rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
       count=$(awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
         index($0, b) == 1 { inblock = 1; next }
         index($0, e) == 1 { inblock = 0; next }
@@ -370,10 +385,20 @@ EOF
       info "Nothing to remove ($KIMI_CONFIG does not exist)."
       exit 0
     fi
-    if ! grep -qF "$BEGIN_MARKER" "$KIMI_CONFIG"; then
-      info "Nothing to remove (no peon-ping block found)."
-      warn_unmanaged_hooks
-      exit 0
+    # grep exits 1 for "read it, no marker" and 2 when it could not read the
+    # file. Only the first means there is nothing to remove; taking the second
+    # for it would let uninstall.sh delete the adapter the hooks still run.
+    if grep -qF "$BEGIN_MARKER" "$KIMI_CONFIG"; then
+      :
+    else
+      rc=$?
+      if [ "$rc" -eq 1 ]; then
+        info "Nothing to remove (no peon-ping block found)."
+        warn_unmanaged_hooks
+        exit 0
+      fi
+      error "Cannot read Kimi config: $KIMI_CONFIG"
+      exit 1
     fi
     tmp="$(mktemp)"
     if ! strip_block "$KIMI_CONFIG" > "$tmp"; then
@@ -381,8 +406,13 @@ EOF
       exit 1
     fi
     # Write through the existing file rather than mv over it, so its mode,
-    # owner and any symlink survive.
-    cat "$tmp" > "$KIMI_CONFIG"
+    # owner and any symlink survive. A failed write has to fail the command:
+    # uninstall.sh deletes the adapter next, and the hooks would point at it.
+    if ! cat "$tmp" > "$KIMI_CONFIG"; then
+      rm -f "$tmp"
+      error "Could not write $KIMI_CONFIG; peon-ping hooks were not removed."
+      exit 1
+    fi
     rm -f "$tmp"
     info "Removed peon-ping hooks from $KIMI_CONFIG"
     warn_unmanaged_hooks
@@ -428,7 +458,11 @@ EOF
       done
       printf '%s%s%s' "$nl" "$END_MARKER" "$nl"
     } >> "$tmp"
-    cat "$tmp" > "$KIMI_CONFIG"
+    if ! cat "$tmp" > "$KIMI_CONFIG"; then
+      rm -f "$tmp"
+      error "Could not write $KIMI_CONFIG; peon-ping hooks were not registered."
+      exit 1
+    fi
     rm -f "$tmp"
 
     info "${BOLD}peon-ping hooks registered for $KIMI_TARGET${RESET}"
