@@ -1037,7 +1037,7 @@ curl -fsSL peonping.com/install | bash -s -- --kimi
 
 - `SessionStart` → 挨拶サウンド（*"Ready to work?"*、*"Yes?"*）
 - `Stop` → 完了サウンド（*"Work, work."*、*"Job's done!"*）
-- `PermissionRequest` → 許可サウンド — Kimi が承認を待っています
+- `PermissionRequest` → 許可サウンド — Kimi が承認を待っています（Kimi Code のみ：`~/.kimi` の旧 kimi-cli には許可イベントがなく、設定にそれが含まれると起動を拒否するため、そちらには登録しません）
 - `PostToolUseFailure` / `StopFailure` → エラーサウンド
 - `PreCompact` → トークン制限サウンド
 - `SubagentStart` / `SubagentStop` → サブエージェント追跡

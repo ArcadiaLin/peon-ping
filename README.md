@@ -1183,7 +1183,7 @@ If `~/.claude/hooks/peon-ping/packs/` already exists with packs, a `--kimi` inst
 
 - `SessionStart` → Greeting sound (*"Ready to work?"*, *"Yes?"*)
 - `Stop` → Completion sound (*"Work, work."*, *"Job's done!"*)
-- `PermissionRequest` → Permission sound — Kimi is waiting on your approval
+- `PermissionRequest` → Permission sound — Kimi is waiting on your approval (Kimi Code only: the older kimi-cli under `~/.kimi` has no permission events and refuses to start with a config that names one, so it is left out there)
 - `PostToolUseFailure` / `StopFailure` → Error sound
 - `PreCompact` → Token limit sound
 - `SubagentStart` / `SubagentStop` → Sub-agent tracking

@@ -16,7 +16,8 @@ setup() {
   ln -sf "$PEON_SH" "$TEST_DIR/peon.sh"
 
   # A Kimi home of our own so --install never touches a real ~/.kimi-code.
-  export KIMI_DIR="$TEST_DIR/kimi_home"
+  # Named like the real one: the event list --install picks depends on it.
+  export KIMI_DIR="$TEST_DIR/.kimi-code"
   export KIMI_CONFIG="$KIMI_DIR/config.toml"
   mkdir -p "$KIMI_DIR"
 
@@ -295,6 +296,75 @@ assert_round_trip() {
   [ "$(cat "$TEST_DIR/dotfiles/kimi.toml")" = "a = 1" ]
   perms=$(stat -c '%a' "$TEST_DIR/dotfiles/kimi.toml" 2>/dev/null || stat -f '%Lp' "$TEST_DIR/dotfiles/kimi.toml")
   [ "$perms" = "640" ]
+}
+
+# kimi-cli 1.28.0-1.52.0 validates `event` against thirteen names and refuses
+# to load a config naming any other; PermissionRequest/PermissionResult are
+# Kimi Code only.
+assert_kimi_cli_events() {
+  [ "$(grep -c '^event = ' "$1")" -eq 9 ]
+  run grep -E '^event = "Permission(Request|Result)"' "$1"
+  [ "$status" -ne 0 ]
+  while read -r ev; do
+    case "$ev" in
+      PreToolUse|PostToolUse|PostToolUseFailure|UserPromptSubmit|Stop|StopFailure|\
+      SessionStart|SessionEnd|SubagentStart|SubagentStop|PreCompact|PostCompact|Notification) ;;
+      *) echo "kimi-cli rejects event $ev"; return 1 ;;
+    esac
+  done < <(sed -n 's/^event = "\(.*\)"$/\1/p' "$1")
+}
+
+@test "--install registers the Permission events for Kimi Code" {
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  grep -qx 'event = "PermissionRequest"' "$KIMI_CONFIG"
+  grep -qx 'event = "PermissionResult"' "$KIMI_CONFIG"
+  [ "$(grep -c '^event = ' "$KIMI_CONFIG")" -eq 11 ]
+}
+
+@test "--install leaves Kimi Code only events out of a kimi-cli config" {
+  export KIMI_DIR="$TEST_DIR/.kimi" KIMI_CONFIG="$TEST_DIR/.kimi/config.toml"
+  mkdir -p "$KIMI_DIR"
+  printf 'default_model = ""\n' > "$KIMI_CONFIG"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"registered for kimi-cli"* ]]
+  [[ "$output" == *"Left out PermissionRequest PermissionResult"* ]]
+  assert_kimi_cli_events "$KIMI_CONFIG"
+}
+
+@test "--install rewrites a kimi-cli block that still names Permission events" {
+  # An install from before this fix left a config kimi-cli cannot load;
+  # re-running --install has to repair it.
+  export KIMI_DIR="$TEST_DIR/.kimi" KIMI_CONFIG="$TEST_DIR/.kimi/config.toml"
+  mkdir -p "$KIMI_DIR"
+  printf '%s\n' 'a = 1' '' '# peon-ping Kimi hooks begin' '' '[[hooks]]' \
+    'event = "PermissionRequest"' 'command = "x"' '' '# peon-ping Kimi hooks end' > "$KIMI_CONFIG"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  assert_kimi_cli_events "$KIMI_CONFIG"
+  [ "$(grep -c 'peon-ping Kimi hooks begin' "$KIMI_CONFIG")" -eq 1 ]
+}
+
+@test "--install treats a config under KIMI_CODE_HOME as Kimi Code" {
+  export KIMI_CODE_HOME="$TEST_DIR/custom-kimi-home"
+  export KIMI_DIR="$KIMI_CODE_HOME" KIMI_CONFIG="$KIMI_CODE_HOME/config.toml"
+  mkdir -p "$KIMI_DIR"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^event = ' "$KIMI_CONFIG")" -eq 11 ]
+}
+
+@test "--install falls back to the events both Kimis accept for an unknown home" {
+  export KIMI_DIR="$TEST_DIR/somewhere" KIMI_CONFIG="$TEST_DIR/somewhere/config.toml"
+  mkdir -p "$KIMI_DIR"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  assert_kimi_cli_events "$KIMI_CONFIG"
 }
 
 @test "--uninstall on a config without the block reports cleanly" {

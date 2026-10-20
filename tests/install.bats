@@ -1120,6 +1120,9 @@ _kimi_test_teardown() {
   bash "$CLONE_DIR/install.sh"
   [ -f "$TEST_HOME/.kimi/config.toml" ]
   grep -qF "# peon-ping Kimi hooks begin" "$TEST_HOME/.kimi/config.toml"
+  # kimi-cli refuses to load a config naming an event outside its schema.
+  run grep -E '^event = "Permission(Request|Result)"' "$TEST_HOME/.kimi/config.toml"
+  [ "$status" -ne 0 ]
   _kimi_test_teardown
 }
 

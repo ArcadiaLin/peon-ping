@@ -72,12 +72,12 @@ LEGACY_LOGFILE="$PEON_DIR/.kimi-adapter.log"
 LEGACY_LAUNCHD_LABEL="com.peonping.kimi-adapter"
 LEGACY_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LAUNCHD_LABEL}.plist"
 
-# Events peon-ping registers, out of the sixteen in Kimi's HOOK_EVENT_TYPES.
-# PreToolUse/PostToolUse fire on every tool call, PostCompact duplicates
-# PreCompact, and Interrupt/Notification have no CESP category, so those five
-# stay unregistered. PermissionResult is registered but silent: it maps to
-# PreToolUse so the tab title stops saying "needs approval" once the prompt is
-# answered.
+# Events peon-ping registers, out of the sixteen in Kimi Code's
+# HOOK_EVENT_TYPES. PreToolUse/PostToolUse fire on every tool call, PostCompact
+# duplicates PreCompact, and Interrupt/Notification have no CESP category, so
+# those five stay unregistered. PermissionResult is registered but silent: it
+# maps to PreToolUse so the tab title stops saying "needs approval" once the
+# prompt is answered.
 HOOK_EVENTS=(
   SessionStart
   SessionEnd
@@ -91,6 +91,30 @@ HOOK_EVENTS=(
   SubagentStop
   PreCompact
 )
+
+# The older kimi-cli (~/.kimi) has hooks from 1.28.0 on, but its schema has
+# thirteen events and none of these. It validates `event` against that list
+# and refuses to load a config.toml naming any other, so registering them
+# would stop kimi-cli from starting at all. Only Kimi Code's own home is known
+# to take the full list; every other config gets the events both accept.
+# Kimi Code can also be moved off ~/.kimi-code with KIMI_CODE_HOME.
+KIMI_CODE_ONLY_EVENTS=(PermissionRequest PermissionResult)
+KIMI_CONFIG_DIR="$(dirname "$KIMI_CONFIG")"
+if [ "$(basename "$KIMI_CONFIG_DIR")" = .kimi-code ] ||
+   { [ -n "${KIMI_CODE_HOME:-}" ] &&
+     { [ "$KIMI_CONFIG_DIR" = "$KIMI_CODE_HOME" ] || [ "$KIMI_CONFIG_DIR" -ef "$KIMI_CODE_HOME" ]; }; }; then
+  KIMI_TARGET="Kimi Code"
+  REGISTER_EVENTS=("${HOOK_EVENTS[@]}")
+else
+  KIMI_TARGET="kimi-cli"
+  REGISTER_EVENTS=()
+  for ev in "${HOOK_EVENTS[@]}"; do
+    case " ${KIMI_CODE_ONLY_EVENTS[*]} " in
+      *" $ev "*) ;;
+      *) REGISTER_EVENTS+=("$ev") ;;
+    esac
+  done
+fi
 
 BOLD=$'\033[1m' DIM=$'\033[2m' RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' RESET=$'\033[0m'
 info()  { printf "%s>%s %s\n" "$GREEN" "$RESET" "$*"; }
@@ -355,7 +379,7 @@ EOF
       fi
       printf '%s%s' "$begin_line" "$nl"
       printf '# install_dir = %s%s' "$PEON_DIR" "$nl"
-      for ev in "${HOOK_EVENTS[@]}"; do
+      for ev in "${REGISTER_EVENTS[@]}"; do
         printf '%s[[hooks]]%s' "$nl" "$nl"
         printf 'event = "%s"%s' "$ev" "$nl"
         printf 'command = %s%s' "$(toml_basic "$HOOK_COMMAND")" "$nl"
@@ -366,12 +390,21 @@ EOF
     cat "$tmp" > "$KIMI_CONFIG"
     rm -f "$tmp"
 
-    info "${BOLD}peon-ping hooks registered for Kimi Code${RESET}"
+    info "${BOLD}peon-ping hooks registered for $KIMI_TARGET${RESET}"
     printf "  %sconfig:%s  %s\n" "$DIM" "$RESET" "$KIMI_CONFIG"
     printf "  %sadapter:%s %s\n" "$DIM" "$RESET" "$ADAPTER"
-    printf "  %sevents:%s  %s\n" "$DIM" "$RESET" "${HOOK_EVENTS[*]}"
+    printf "  %sevents:%s  %s\n" "$DIM" "$RESET" "${REGISTER_EVENTS[*]}"
+    if [ "${#REGISTER_EVENTS[@]}" -lt "${#HOOK_EVENTS[@]}" ]; then
+      warn "Left out ${KIMI_CODE_ONLY_EVENTS[*]}: only Kimi Code (~/.kimi-code) has them,"
+      warn "and the older kimi-cli refuses to start with a config that names them."
+      warn "Approval prompts stay silent until you move to Kimi Code."
+    fi
     echo ""
-    info "Run 'kimi doctor' to validate, then restart Kimi Code."
+    if [ "$KIMI_TARGET" = "Kimi Code" ]; then
+      info "Run 'kimi doctor' to validate, then restart Kimi Code."
+    else
+      info "Restart kimi-cli (1.28.0 or later; earlier versions have no hooks)."
+    fi
     exit 0
     ;;
 
