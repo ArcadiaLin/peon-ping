@@ -268,6 +268,35 @@ locate_block() {
   ' "$1"
 }
 
+count_unmanaged_hooks() {
+  # Count lines outside the managed block that run this adapter. Kimi Code's
+  # kimi-cli migration copies [[hooks]] from ~/.kimi/config.toml into its own
+  # config by re-serializing them, which drops our markers, so a block from a
+  # kimi-cli install can come back unmarked next to the one --install writes.
+  # Only the marked block is ours to edit; these are reported, not touched.
+  awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+    index($0, b) == 1 { skip = 1; next }
+    index($0, e) == 1 { skip = 0; next }
+    skip || /^[[:space:]]*#/ { next }
+    /adapters[\/\\]+kimi\.(sh|ps1)/ { n++ }
+    END { print n + 0 }
+  ' "$1"
+}
+
+warn_unmanaged_hooks() {
+  local n
+  [ -f "$KIMI_CONFIG" ] || return 0
+  n="$(count_unmanaged_hooks "$KIMI_CONFIG")"
+  [ "$n" -gt 0 ] || return 0
+  # stderr: uninstall.sh discards the adapter's stdout.
+  {
+    warn "$KIMI_CONFIG has $n hook command(s) outside the peon-ping block that run the Kimi adapter."
+    warn "Kimi Code's migration from kimi-cli copies hooks without the block markers, so these"
+    warn "were likely carried over from ~/.kimi: each event they cover plays twice, and"
+    warn "uninstalling peon-ping leaves them behind. Remove those [[hooks]] entries by hand."
+  } >&2
+}
+
 strip_block() {
   # Print the config with the managed block removed, along with the separator
   # and EOF newline --install added for it, and every other byte untouched.
@@ -319,9 +348,11 @@ EOF
         END { print n + 0 }
       ' "$KIMI_CONFIG")
       info "peon-ping hooks registered in $KIMI_CONFIG ($count events)"
+      warn_unmanaged_hooks
       exit 0
     fi
     warn "peon-ping hooks not registered in $KIMI_CONFIG"
+    warn_unmanaged_hooks
     exit 1
     ;;
 
@@ -333,6 +364,7 @@ EOF
     fi
     if ! grep -qF "$BEGIN_MARKER" "$KIMI_CONFIG"; then
       info "Nothing to remove (no peon-ping block found)."
+      warn_unmanaged_hooks
       exit 0
     fi
     tmp="$(mktemp)"
@@ -345,6 +377,7 @@ EOF
     cat "$tmp" > "$KIMI_CONFIG"
     rm -f "$tmp"
     info "Removed peon-ping hooks from $KIMI_CONFIG"
+    warn_unmanaged_hooks
     exit 0
     ;;
 
@@ -399,6 +432,7 @@ EOF
       warn "and the older kimi-cli refuses to start with a config that names them."
       warn "Approval prompts stay silent until you move to Kimi Code."
     fi
+    warn_unmanaged_hooks
     echo ""
     if [ "$KIMI_TARGET" = "Kimi Code" ]; then
       info "Run 'kimi doctor' to validate, then restart Kimi Code."

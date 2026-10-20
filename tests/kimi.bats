@@ -367,6 +367,76 @@ assert_kimi_cli_events() {
   assert_kimi_cli_events "$KIMI_CONFIG"
 }
 
+# What Kimi Code's kimi-cli migration leaves behind: hooks re-serialized out of
+# ~/.kimi/config.toml, our block markers gone.
+seed_migrated_hooks() {
+  cat > "$KIMI_CONFIG" <<TOML
+default_model = "k2"
+
+[[hooks]]
+event = "Stop"
+command = "CLAUDE_PEON_DIR='$TEST_DIR' bash '$TEST_DIR/adapters/kimi.sh'"
+timeout = 10
+
+[[hooks]]
+event = "SessionStart"
+command = "CLAUDE_PEON_DIR='$TEST_DIR' bash '$TEST_DIR/adapters/kimi.sh'"
+timeout = 10
+TOML
+}
+
+@test "--install warns about adapter hooks outside its block and leaves them alone" {
+  seed_migrated_hooks
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.orig"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"2 hook command(s) outside the peon-ping block"* ]]
+  # Only the marked block was added; the unmarked hooks are byte-identical.
+  head -c "$(wc -c < "$TEST_DIR/config.orig")" "$KIMI_CONFIG" > "$TEST_DIR/config.head"
+  run cmp "$TEST_DIR/config.head" "$TEST_DIR/config.orig"
+  [ "$status" -eq 0 ]
+}
+
+@test "--status and --uninstall warn about adapter hooks outside the block" {
+  seed_migrated_hooks
+  run_kimi_flag --install
+
+  run_kimi_flag --status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"outside the peon-ping block"* ]]
+
+  run_kimi_flag --uninstall
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"outside the peon-ping block"* ]]
+  [ "$(grep -c 'adapters/kimi.sh' "$KIMI_CONFIG")" -eq 2 ]
+}
+
+@test "--uninstall warns about unmarked adapter hooks even with no block to remove" {
+  seed_migrated_hooks
+  run_kimi_flag --uninstall
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Nothing to remove"* ]]
+  [[ "$output" == *"2 hook command(s) outside the peon-ping block"* ]]
+}
+
+@test "the unmanaged-hook check sees a Windows adapter path too" {
+  printf '%s\n' '[[hooks]]' 'event = "Stop"' \
+    "command = 'powershell -NoProfile -File \"C:\\peon\\adapters\\kimi.ps1\"'" > "$KIMI_CONFIG"
+  run_kimi_flag --install
+  [[ "$output" == *"1 hook command(s) outside the peon-ping block"* ]]
+}
+
+@test "--install does not warn when the only adapter hooks are its own" {
+  printf 'default_model = "k2"\n# bash adapters/kimi.sh in a comment is not a hook\n' > "$KIMI_CONFIG"
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  run_kimi_flag --install
+  [[ "$output" != *"outside the peon-ping block"* ]]
+  run_kimi_flag --status
+  [[ "$output" != *"outside the peon-ping block"* ]]
+}
+
 @test "--uninstall on a config without the block reports cleanly" {
   seed_config 'default_model = "x"
 '
