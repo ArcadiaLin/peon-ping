@@ -545,7 +545,7 @@ Describe "Category B: Kimi Adapter" {
         $script:kimiPath = Join-Path $script:AdaptersDir "kimi.ps1"
         $script:kimiContent = Get-Content $script:kimiPath -Raw
 
-        # A throwaway peon dir and Kimi config so -Install/-Uninstall never
+        # A throwaway peon dir and Kimi configs so -Install/-Uninstall never
         # touch a real ~/.kimi-code. The space in the path is deliberate: the
         # hook command has to survive cmd.exe word splitting.
         $script:kimiSandbox = Join-Path ([System.IO.Path]::GetTempPath()) "peon kimi-$([guid]::NewGuid().ToString('N').Substring(0,8))"
@@ -554,28 +554,81 @@ Describe "Category B: Kimi Adapter" {
         Set-Content -Path (Join-Path $script:kimiPeonDir "peon.ps1") -Value "exit 0" -Encoding UTF8
         Copy-Item $script:kimiPath (Join-Path $script:kimiPeonDir "adapters\kimi.ps1") -Force
         $script:kimiSandboxAdapter = Join-Path $script:kimiPeonDir "adapters\kimi.ps1"
+        # The event list depends on the config's home: .kimi-code is Kimi Code,
+        # .kimi the older kimi-cli.
         $script:kimiConfigDir = Join-Path $script:kimiSandbox ".kimi-code"
-        New-Item -ItemType Directory -Path $script:kimiConfigDir -Force | Out-Null
+        $script:kimiCliConfigDir = Join-Path $script:kimiSandbox ".kimi"
+        New-Item -ItemType Directory -Path $script:kimiConfigDir, $script:kimiCliConfigDir -Force | Out-Null
+
+        # A second install root whose adapters\kimi.ps1 is a long-running
+        # stand-in for the watcher daemon. The real adapter in hook mode exits at
+        # once, so it cannot play the daemon itself.
+        $script:kimiLegacyPeonDir = Join-Path $script:kimiSandbox "legacy peon"
+        New-Item -ItemType Directory -Path (Join-Path $script:kimiLegacyPeonDir "adapters") -Force | Out-Null
+        Set-Content -Path (Join-Path $script:kimiLegacyPeonDir "peon.ps1") -Value "exit 0" -Encoding UTF8
+        $script:kimiLegacyScript = Join-Path $script:kimiLegacyPeonDir "adapters\kimi.ps1"
+        Set-Content -Path $script:kimiLegacyScript -Value "Start-Sleep -Seconds 60" -Encoding UTF8
+        $script:kimiLegacyPidFile = Join-Path $script:kimiLegacyPeonDir ".kimi-adapter.pid"
+
+        function Start-KimiProcess {
+            param([string]$Exe = "powershell", [string[]]$ArgumentList)
+            Start-Process -FilePath $Exe -ArgumentList $ArgumentList -PassThru -WindowStyle Hidden
+        }
+
+        function Start-KimiLegacyWatcher {
+            # How v2.37.0 launched the watcher.
+            param([string]$Script = $script:kimiLegacyScript)
+            Start-KimiProcess -ArgumentList @("-NoProfile", "-File", "`"$Script`"")
+        }
 
         function Invoke-KimiAdapter {
-            param([string]$Config, [string[]]$AdapterArgs)
-            $env:CLAUDE_PEON_DIR = $script:kimiPeonDir
-            $env:KIMI_DIR = $script:kimiConfigDir
+            # stdout and stderr are kept apart: uninstall.ps1 discards the
+            # adapter's stdout, so a warning only reaches the user on stderr.
+            param([string]$Config, [string[]]$AdapterArgs, [string]$PeonDir = $script:kimiPeonDir,
+                  [hashtable]$ExtraEnv = @{})
+            $env:CLAUDE_PEON_DIR = $PeonDir
             $env:KIMI_CONFIG = $Config
+            foreach ($key in $ExtraEnv.Keys) { Set-Item "Env:\$key" $ExtraEnv[$key] }
             try {
-                $out = & powershell -NoProfile -NonInteractive -File $script:kimiSandboxAdapter @AdapterArgs 2>&1
-                return [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
+                $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell"
+                $psi.Arguments = "-NoProfile -NonInteractive -File `"$script:kimiSandboxAdapter`" $($AdapterArgs -join ' ')"
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $proc = [System.Diagnostics.Process]::Start($psi)
+                $stdout = $proc.StandardOutput.ReadToEndAsync()
+                $stderr = $proc.StandardError.ReadToEndAsync()
+                $proc.WaitForExit()
+                return [PSCustomObject]@{
+                    ExitCode = $proc.ExitCode
+                    Stdout   = $stdout.Result
+                    Stderr   = $stderr.Result
+                    Output   = $stdout.Result + $stderr.Result
+                }
             } finally {
-                Remove-Item Env:\CLAUDE_PEON_DIR, Env:\KIMI_DIR, Env:\KIMI_CONFIG -ErrorAction SilentlyContinue
+                Remove-Item Env:\CLAUDE_PEON_DIR, Env:\KIMI_CONFIG -ErrorAction SilentlyContinue
+                foreach ($key in $ExtraEnv.Keys) { Remove-Item "Env:\$key" -ErrorAction SilentlyContinue }
             }
         }
 
         function New-KimiConfig {
-            param([string]$Body)
-            $path = Join-Path $script:kimiConfigDir "config-$([guid]::NewGuid().ToString('N').Substring(0,8)).toml"
+            param([string]$Body, [string]$Dir = $script:kimiConfigDir)
+            $path = Join-Path $Dir "config-$([guid]::NewGuid().ToString('N').Substring(0,8)).toml"
             [System.IO.File]::WriteAllText($path, $Body, (New-Object System.Text.UTF8Encoding $false))
             return $path
         }
+
+        function Get-KimiConfigText([string]$Path) {
+            [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding $false))
+        }
+
+        function Get-KimiEvents([string]$Path) {
+            @([regex]::Matches((Get-KimiConfigText $Path), '(?m)^event = "([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+        }
+
+        # A config shaped like the output of Kimi Code's kimi-cli migration: the
+        # adapter's hooks re-serialized without the block markers.
+        $script:kimiUnmarkedHooks = "[[hooks]]`nevent = ""Stop""`ncommand = ""CLAUDE_PEON_DIR='/home/u/.claude/hooks/peon-ping' bash '/home/u/.claude/hooks/peon-ping/adapters/kimi.sh'""`ntimeout = 10`n"
     }
 
     AfterAll {
@@ -584,10 +637,11 @@ Describe "Category B: Kimi Adapter" {
         }
     }
 
-    It "has Install/Uninstall/Status/Help flags" {
+    It "has Install/Uninstall/Status/StopWatcher/Help flags" {
         $script:kimiContent | Should -Match '\[switch\]\$Install'
         $script:kimiContent | Should -Match '\[switch\]\$Uninstall'
         $script:kimiContent | Should -Match '\[switch\]\$Status'
+        $script:kimiContent | Should -Match '\[switch\]\$StopWatcher'
         $script:kimiContent | Should -Match '\[switch\]\$Help'
     }
 
@@ -600,94 +654,159 @@ Describe "Category B: Kimi Adapter" {
         $script:kimiContent | Should -Match 'function Stop-LegacyWatcher'
     }
 
-    It "stops the watcher daemon it replaced and clears its pidfile" {
-        # An update only replaces the script on disk, so the old daemon would
-        # keep running and every sound would play twice.
-        $legacy = Start-Process -FilePath "powershell" `
-            -ArgumentList "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60" `
-            -PassThru -WindowStyle Hidden
-        $pidFile = Join-Path $script:kimiPeonDir ".kimi-adapter.pid"
-        Set-Content -Path $pidFile -Value $legacy.Id -Encoding ASCII
-        try {
-            $result = Invoke-KimiAdapter -Config (New-KimiConfig "") -AdapterArgs @("-Install")
+    Context "the watcher daemon it replaced" {
+        AfterEach {
+            Remove-Item $script:kimiLegacyPidFile -Force -ErrorAction SilentlyContinue
+        }
+
+        It "stops the watcher on <flag> and clears its pidfile" -ForEach @(
+            @{ flag = "-Install" }, @{ flag = "-Uninstall" }, @{ flag = "-StopWatcher" }
+        ) {
+            # An update only replaces the script on disk, so the old daemon would
+            # keep running and every sound would play twice.
+            $legacy = Start-KimiLegacyWatcher
+            Set-Content -Path $script:kimiLegacyPidFile -Value $legacy.Id -Encoding ASCII
+            try {
+                $result = Invoke-KimiAdapter -Config (New-KimiConfig "") -AdapterArgs @($flag) -PeonDir $script:kimiLegacyPeonDir
+                $result.ExitCode | Should -Be 0
+                Test-Path $script:kimiLegacyPidFile | Should -BeFalse
+                $legacy.WaitForExit(5000) | Should -BeTrue
+            } finally {
+                if (-not $legacy.HasExited) { Stop-Process -Id $legacy.Id -Force -ErrorAction SilentlyContinue }
+            }
+        }
+
+        It "-StopWatcher leaves the config alone" {
+            $config = New-KimiConfig "default_model = ""x"""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            $before = [System.IO.File]::ReadAllBytes($config)
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-StopWatcher")
             $result.ExitCode | Should -Be 0
-            Test-Path $pidFile | Should -BeFalse
-            $legacy.WaitForExit(5000) | Should -BeTrue
-        } finally {
-            if (-not $legacy.HasExited) { Stop-Process -Id $legacy.Id -Force -ErrorAction SilentlyContinue }
-            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($config)) | Should -Be ([Convert]::ToBase64String($before))
+        }
+
+        It "does not kill <name> that reused the pid" -ForEach @(
+            # The pid outlives the process that wrote it, so one now belonging to
+            # something else has to be left alone -- PowerShell or not.
+            @{ name = "a non-PowerShell process"; exe = "cmd.exe"; argv = @("/c", "ping -n 60 127.0.0.1 > nul"); warns = $false },
+            @{ name = "an unrelated PowerShell session"; exe = "powershell"; argv = @("-NoProfile", "-Command", "Start-Sleep -Seconds 60"); warns = $false },
+            # Mentioning the adapter is not being it: the watcher never ran under
+            # anything but Windows PowerShell.
+            @{ name = "a cmd.exe whose command line names the adapter"; exe = "cmd.exe"; argv = "cmdargs"; warns = $true },
+            # The adapter path inside one argument is not the adapter as argv[3]:
+            # a text match on the joined command line would take this for it.
+            @{ name = "a PowerShell handed '-NoProfile -File <adapter>' inside one argument"; exe = "powershell"; argv = "embedded"; warns = $true },
+            @{ name = "this adapter run with a switch"; exe = "powershell"; argv = "switch"; warns = $true },
+            @{ name = "a kimi.ps1 from another install"; exe = "powershell"; argv = "other"; warns = $true }
+        ) {
+            switch ($argv) {
+                "embedded" { $argv = @("-NoProfile", "-Command", "`"Start-Sleep -Seconds 60 # -NoProfile -File $script:kimiLegacyScript`"") }
+                "switch"   { $argv = @("-NoProfile", "-File", "`"$script:kimiLegacyScript`"", "-Status") }
+                "cmdargs"  { $argv = @("/c", "`"ping -n 60 127.0.0.1 > nul & rem -NoProfile -File $script:kimiLegacyScript`"") }
+                "other"    {
+                    $otherDir = Join-Path $script:kimiSandbox "other install\adapters"
+                    New-Item -ItemType Directory -Path $otherDir -Force | Out-Null
+                    Set-Content -Path (Join-Path $otherDir "kimi.ps1") -Value "Start-Sleep -Seconds 60" -Encoding UTF8
+                    $argv = @("-NoProfile", "-File", "`"$(Join-Path $otherDir 'kimi.ps1')`"")
+                }
+            }
+            $unrelated = Start-KimiProcess -Exe $exe -ArgumentList $argv
+            Set-Content -Path $script:kimiLegacyPidFile -Value $unrelated.Id -Encoding ASCII
+            try {
+                $result = Invoke-KimiAdapter -Config (New-KimiConfig "") -AdapterArgs @("-Install") -PeonDir $script:kimiLegacyPeonDir
+                $result.ExitCode | Should -Be 0
+                Test-Path $script:kimiLegacyPidFile | Should -BeFalse
+                $unrelated.HasExited | Should -BeFalse
+                if ($warns) {
+                    $result.Stderr | Should -Match "PID $($unrelated.Id) may be the old Kimi watcher"
+                } else {
+                    $result.Stderr | Should -Not -Match 'may be the old Kimi watcher'
+                }
+            } finally {
+                Stop-Process -Id $unrelated.Id -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
-    It "clears a stale pidfile without killing whatever reused the pid" {
-        # The pid outlives the process that wrote it, so one now belonging to
-        # something else has to be left alone.
-        $unrelated = Start-Process -FilePath "cmd.exe" `
-            -ArgumentList "/c", "ping -n 60 127.0.0.1 > nul" `
-            -PassThru -WindowStyle Hidden
-        $pidFile = Join-Path $script:kimiPeonDir ".kimi-adapter.pid"
-        Set-Content -Path $pidFile -Value $unrelated.Id -Encoding ASCII
-        try {
-            $result = Invoke-KimiAdapter -Config (New-KimiConfig "") -AdapterArgs @("-Install")
+    Context "which events it registers" {
+        It "registers all eleven events, Permission ones included, for Kimi Code" {
+            $config = New-KimiConfig ""
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install")
             $result.ExitCode | Should -Be 0
-            Test-Path $pidFile | Should -BeFalse
-            $unrelated.HasExited | Should -BeFalse
-        } finally {
-            Stop-Process -Id $unrelated.Id -Force -ErrorAction SilentlyContinue
-            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            $result.Stdout | Should -Match 'registered for Kimi Code'
+            $result.Stdout | Should -Match "kimi doctor"
+            $events = Get-KimiEvents $config
+            $events.Count | Should -Be 11
+            $events | Should -Contain "PermissionRequest"
+            $events | Should -Contain "PermissionResult"
         }
-    }
 
-    It "reaps the watcher daemon on -Uninstall too" {
-        $config = New-KimiConfig ""
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+        It "writes a [[hooks]] entry for <hookEvent>" -ForEach @(
+            @{ hookEvent = "SessionStart" }, @{ hookEvent = "SessionEnd" },
+            @{ hookEvent = "UserPromptSubmit" }, @{ hookEvent = "Stop" },
+            @{ hookEvent = "StopFailure" }, @{ hookEvent = "PermissionRequest" },
+            @{ hookEvent = "PermissionResult" }, @{ hookEvent = "PostToolUseFailure" },
+            @{ hookEvent = "SubagentStart" }, @{ hookEvent = "SubagentStop" },
+            @{ hookEvent = "PreCompact" }
+        ) {
+            $config = New-KimiConfig ""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            Get-KimiEvents $config | Should -Contain $hookEvent
+        }
 
-        $legacy = Start-Process -FilePath "powershell" `
-            -ArgumentList "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60" `
-            -PassThru -WindowStyle Hidden
-        $pidFile = Join-Path $script:kimiPeonDir ".kimi-adapter.pid"
-        Set-Content -Path $pidFile -Value $legacy.Id -Encoding ASCII
-        try {
-            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall")
+        It "leaves the per-tool-call and no-category events unregistered" {
+            $config = New-KimiConfig ""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            $events = Get-KimiEvents $config
+            foreach ($skipped in @("PreToolUse", "PostToolUse", "PostCompact", "Interrupt", "Notification")) {
+                $events | Should -Not -Contain $skipped
+            }
+        }
+
+        It "leaves the Kimi Code only events out of a kimi-cli config" {
+            # kimi-cli validates `event` against its own thirteen and refuses to
+            # start with a config naming any other.
+            $config = New-KimiConfig "" -Dir $script:kimiCliConfigDir
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install")
             $result.ExitCode | Should -Be 0
-            Test-Path $pidFile | Should -BeFalse
-            $legacy.WaitForExit(5000) | Should -BeTrue
-        } finally {
-            if (-not $legacy.HasExited) { Stop-Process -Id $legacy.Id -Force -ErrorAction SilentlyContinue }
-            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            $result.Stdout | Should -Match 'registered for kimi-cli'
+            $result.Stdout | Should -Not -Match 'kimi doctor'
+            $result.Stderr | Should -Match 'Left out PermissionRequest PermissionResult'
+            $events = Get-KimiEvents $config
+            $events.Count | Should -Be 9
+            $events | Should -Not -Contain "PermissionRequest"
+            $events | Should -Not -Contain "PermissionResult"
         }
-    }
 
-    It "prefers ~/.kimi-code and falls back to the older ~/.kimi" {
-        $script:kimiContent | Should -Match '"\.kimi-code"'
-        $script:kimiContent | Should -Match '"\.kimi"'
-    }
+        It "rewrites a kimi-cli block that still names Permission events" {
+            # An earlier install wrote all eleven into ~/.kimi, which stopped
+            # kimi-cli from starting; re-running -Install repairs it.
+            $kimiCode = New-KimiConfig "default_model = ""x""`n"
+            Invoke-KimiAdapter -Config $kimiCode -AdapterArgs @("-Install") | Out-Null
+            $config = New-KimiConfig (Get-KimiConfigText $kimiCode) -Dir $script:kimiCliConfigDir
+            Get-KimiEvents $config | Should -Contain "PermissionRequest"
 
-    It "registers hooks and says so" {
-        $result = Invoke-KimiAdapter -Config (New-KimiConfig "") -AdapterArgs @("-Install")
-        $result.ExitCode | Should -Be 0
-        $result.Output | Should -Match 'registered for Kimi Code'
-    }
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            $events = Get-KimiEvents $config
+            $events.Count | Should -Be 9
+            $events | Should -Not -Contain "PermissionRequest"
+            (Get-KimiConfigText $config) | Should -Match '^default_model = "x"'
+        }
 
-    It "writes a [[hooks]] entry for <hookEvent>" -ForEach @(
-        @{ hookEvent = "SessionStart" }, @{ hookEvent = "SessionEnd" },
-        @{ hookEvent = "UserPromptSubmit" }, @{ hookEvent = "Stop" },
-        @{ hookEvent = "StopFailure" }, @{ hookEvent = "PermissionRequest" },
-        @{ hookEvent = "PermissionResult" }, @{ hookEvent = "PostToolUseFailure" },
-        @{ hookEvent = "SubagentStart" }, @{ hookEvent = "SubagentStop" },
-        @{ hookEvent = "PreCompact" }
-    ) {
-        $config = New-KimiConfig ""
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        Get-Content $config -Raw | Should -Match "event = ""$hookEvent"""
-    }
+        It "treats a config under KIMI_CODE_HOME as Kimi Code" {
+            $customHome = Join-Path $script:kimiSandbox "custom kimi home"
+            New-Item -ItemType Directory -Path $customHome -Force | Out-Null
+            $config = New-KimiConfig "" -Dir $customHome
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") -ExtraEnv @{ KIMI_CODE_HOME = "$customHome\" } | Out-Null
+            (Get-KimiEvents $config).Count | Should -Be 11
+        }
 
-    It "leaves the per-tool-call and no-category events unregistered" {
-        $config = New-KimiConfig ""
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        $written = Get-Content $config -Raw
-        foreach ($skipped in @("PreToolUse", "PostToolUse", "PostCompact", "Interrupt", "Notification")) {
-            $written | Should -Not -Match "event = ""$skipped"""
+        It "falls back to the events both Kimis accept for an unknown home" {
+            $unknown = Join-Path $script:kimiSandbox "somewhere else"
+            New-Item -ItemType Directory -Path $unknown -Force | Out-Null
+            $config = New-KimiConfig "" -Dir $unknown
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            (Get-KimiEvents $config).Count | Should -Be 9
         }
     }
 
@@ -696,7 +815,7 @@ Describe "Category B: Kimi Adapter" {
         # Windows, which splits an unquoted C:\Users\First Last\... in half.
         $config = New-KimiConfig ""
         Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        $command = ([regex]::Match((Get-Content $config -Raw), "(?m)^command = '(.+)'\r?$")).Groups[1].Value
+        $command = ([regex]::Match((Get-KimiConfigText $config), "(?m)^command = '(.+)'\r?$")).Groups[1].Value
         $command | Should -Match '^powershell -NoProfile -NonInteractive -File "'
         $command | Should -Match 'peon dir'
         $command | Should -Match '"$'
@@ -705,40 +824,202 @@ Describe "Category B: Kimi Adapter" {
     It "keeps an existing hook and appends the block behind markers" {
         $config = New-KimiConfig "default_model = ""kimi-code/kimi-for-coding""`n`n[[hooks]]`nevent = ""PreToolUse""`ncommand = ""other-tool""`n"
         Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        $written = Get-Content $config -Raw
+        $written = Get-KimiConfigText $config
         $written | Should -Match 'command = "other-tool"'
         $written | Should -Match '# peon-ping Kimi hooks begin'
         $written | Should -Match '# peon-ping Kimi hooks end'
     }
 
-    It "is idempotent across repeated installs" {
-        $config = New-KimiConfig "default_model = ""x""`n"
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        $first = Get-Content $config -Raw
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        Get-Content $config -Raw | Should -Be $first
-    }
-
-    It "restores <name> byte for byte on uninstall" -ForEach @(
-        @{ name = "a config with no trailing blank line"; body = "default_model = ""x""`n[[hooks]]`nevent = ""PreToolUse""`n" },
-        @{ name = "a config that already ended in a blank line"; body = "default_model = ""x""`n[[hooks]]`nevent = ""PreToolUse""`n`n" },
-        @{ name = "a CRLF config"; body = "default_model = ""x""`r`n[[hooks]]`r`nevent = ""PreToolUse""`r`n" },
-        @{ name = "an empty config"; body = "" }
+    It "is idempotent across repeated installs on <name>" -ForEach @(
+        @{ name = "a config ending in a newline"; body = "default_model = ""x""`n" },
+        @{ name = "a config with no final newline"; body = "default_model = ""x""" }
     ) {
         $config = New-KimiConfig $body
-        $before = [System.IO.File]::ReadAllBytes($config)
         Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall") | Out-Null
-        $after = [System.IO.File]::ReadAllBytes($config)
-        (@(Compare-Object $after $before -SyncWindow 0)).Count | Should -Be 0
+        $first = [System.IO.File]::ReadAllBytes($config)
+        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($config)) | Should -Be ([Convert]::ToBase64String($first))
     }
 
-    It "keeps the newline style the config already used" {
-        $config = New-KimiConfig "default_model = ""x""`r`n"
-        Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
-        $raw = Get-Content $config -Raw
-        $raw | Should -Match "`r`n"
-        ($raw -replace "`r`n", "") | Should -Not -Match "`n"
+    Context "bytes outside the block" {
+        It "restores <name> byte for byte on uninstall" -ForEach @(
+            @{ name = "a config ending in a single newline"; body = "default_model = ""x""`n[[hooks]]`nevent = ""PreToolUse""`n" },
+            @{ name = "a config that already ended in a blank line"; body = "default_model = ""x""`n[[hooks]]`nevent = ""PreToolUse""`n`n" },
+            @{ name = "a config with several trailing blank lines"; body = "default_model = ""x""`n`n`n`n" },
+            @{ name = "a config with no final newline"; body = "default_model = ""x""" },
+            @{ name = "a multi-line config with no final newline"; body = "default_model = ""x""`n[[hooks]]`nevent = ""PreToolUse""" },
+            @{ name = "whitespace inside a multiline value"; body = "prompt = '''`nfirst`n   `n`t`nlast`n'''`n" },
+            @{ name = "a CRLF config"; body = "default_model = ""x""`r`n[[hooks]]`r`nevent = ""PreToolUse""`r`n" },
+            @{ name = "a CRLF config with no final newline"; body = "default_model = ""x""`r`n[[hooks]]`r`nevent = ""PreToolUse""" },
+            @{ name = "a CRLF config ending in a blank line"; body = "default_model = ""x""`r`n`r`n" },
+            @{ name = "mixed line endings"; body = "a = 1`r`nb = 2`nc = 3`r`n" },
+            @{ name = "non-ASCII text"; body = "name = ""$([char]0x4E2D)$([char]0x6587)""`n# $([char]0x00E9)t$([char]0x00E9) $([char]0xD83D)$([char]0xDE00)`n" },
+            @{ name = "a UTF-8 BOM"; body = "$([char]0xFEFF)default_model = ""x""`n" },
+            @{ name = "an empty config"; body = "" }
+        ) {
+            $config = New-KimiConfig $body
+            $before = [System.IO.File]::ReadAllBytes($config)
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall") | Out-Null
+            $after = [System.IO.File]::ReadAllBytes($config)
+            (@(Compare-Object $after $before -SyncWindow 0)).Count | Should -Be 0
+            $after.Length | Should -Be $before.Length
+        }
+
+        It "keeps non-ASCII text intact while the block is installed" {
+            # Windows PowerShell 5.1 reads a BOM-less file in the ANSI code page,
+            # so a decode/re-encode round trip garbles UTF-8 for good.
+            $chinese = "$([char]0x4E2D)$([char]0x6587)"
+            $config = New-KimiConfig "name = ""$chinese""`n"
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            $written = Get-KimiConfigText $config
+            $written | Should -Match ([regex]::Escape("name = ""$chinese"""))
+            $written | Should -Match '# peon-ping Kimi hooks begin'
+        }
+
+        It "writes the block in the config's own CRLF line endings" {
+            $config = New-KimiConfig "default_model = ""x""`r`n"
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            $raw = Get-KimiConfigText $config
+            $raw | Should -Match "hooks end`r`n$"
+            ($raw -replace "`r`n", "") | Should -Not -Match "`n"
+        }
+
+        It "writes an LF block into an LF or empty config" {
+            # Kimi writes config.toml from Node, so it is LF even on Windows.
+            $config = New-KimiConfig ""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            Get-KimiConfigText $config | Should -Not -Match "`r"
+        }
+
+        It "records the newline it adds to an unterminated last line" {
+            $config = New-KimiConfig "default_model = ""x"""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            Get-KimiConfigText $config | Should -Match '(?m)^default_model = "x"\n\n# peon-ping Kimi hooks begin \(newline added at end of file\)$'
+        }
+
+        It "keeps the added newline when the user wrote after the block" {
+            # Taking it back would glue the user's line onto the one before.
+            $config = New-KimiConfig "default_model = ""x"""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            [System.IO.File]::AppendAllText($config, "theme = ""dark""`n")
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall") | Out-Null
+            Get-KimiConfigText $config | Should -BeExactly "default_model = ""x""`ntheme = ""dark""`n"
+        }
+
+        It "refuses an unterminated block on <flag> and leaves it alone" -ForEach @(
+            @{ flag = "-Install" }, @{ flag = "-Uninstall" }
+        ) {
+            # Without the end marker there is no telling where the block stops;
+            # deleting to the end of the file could take the user's settings.
+            $config = New-KimiConfig "a = 1`n`n# peon-ping Kimi hooks begin`n[[hooks]]`nevent = ""Stop""`n`n[other]`nb = 2`n"
+            $before = [System.IO.File]::ReadAllBytes($config)
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @($flag)
+            $result.ExitCode | Should -Be 1
+            $result.Stderr | Should -Match 'without "# peon-ping Kimi hooks end"'
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($config)) | Should -Be ([Convert]::ToBase64String($before))
+        }
+
+        It "fails <flag> when the config cannot be written" -ForEach @(
+            @{ flag = "-Install"; claim = "registered for" }, @{ flag = "-Uninstall"; claim = "Removed peon-ping hooks" }
+        ) {
+            # A swallowed write error used to report success and exit 0, after
+            # which uninstall.ps1 deleted the adapter the hooks still ran.
+            $config = New-KimiConfig "default_model = ""x"""
+            if ($flag -eq "-Uninstall") { Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null }
+            $before = [System.IO.File]::ReadAllBytes($config)
+            (Get-Item -LiteralPath $config).IsReadOnly = $true
+            try {
+                $result = Invoke-KimiAdapter -Config $config -AdapterArgs @($flag)
+                $result.ExitCode | Should -Be 1
+                $result.Stderr | Should -Match 'Could not write'
+                $result.Stdout | Should -Not -Match $claim
+                [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($config)) | Should -Be ([Convert]::ToBase64String($before))
+            } finally {
+                (Get-Item -LiteralPath $config).IsReadOnly = $false
+            }
+        }
+
+        It "refuses -Install on a config it cannot read instead of writing over it" {
+            # Read as empty, the config would have been replaced by the block
+            # alone. Deny reading but not writing, so only the read guard stops it.
+            $config = New-KimiConfig "default_model = ""x""`n"
+            $before = [System.IO.File]::ReadAllBytes($config)
+            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            & icacls $config /deny "${identity}:(RD)" | Out-Null
+            try {
+                $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install")
+                $result.ExitCode | Should -Be 1
+                $result.Stderr | Should -Match 'Could not read'
+                $result.Stdout | Should -Not -Match 'registered for'
+            } finally {
+                & icacls $config /remove:d $identity | Out-Null
+            }
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($config)) | Should -Be ([Convert]::ToBase64String($before))
+        }
+
+        It "fails -Uninstall rather than report nothing to remove when the config cannot be read" {
+            $config = New-KimiConfig "default_model = ""x"""
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            # An exclusive handle stands in for a config another program has locked.
+            $lock = [System.IO.File]::Open($config, 'Open', 'ReadWrite', 'None')
+            try {
+                $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall")
+                $result.ExitCode | Should -Be 1
+                $result.Stderr | Should -Match 'Could not read'
+                $result.Stdout | Should -Not -Match 'Nothing to remove'
+            } finally {
+                $lock.Dispose()
+            }
+        }
+
+        It "writes through the existing file instead of replacing it" {
+            # Replacing the file would drop its ACL and break a link to it. A hard
+            # link needs no elevation, unlike a symlink, and shows the difference.
+            $config = New-KimiConfig "default_model = ""x""`n"
+            $link = Join-Path $script:kimiConfigDir "linked-$([guid]::NewGuid().ToString('N').Substring(0,8)).toml"
+            New-Item -ItemType HardLink -Path $link -Target $config | Out-Null
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
+            Get-KimiConfigText $link | Should -Match '# peon-ping Kimi hooks begin'
+            Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall") | Out-Null
+            Get-KimiConfigText $link | Should -BeExactly "default_model = ""x""`n"
+        }
+    }
+
+    Context "adapter hooks outside the managed block" {
+        It "warns on <flag> and leaves them byte for byte" -ForEach @(
+            @{ flag = "-Install" }, @{ flag = "-Status" }, @{ flag = "-Uninstall" }
+        ) {
+            $config = New-KimiConfig "default_model = ""x""`n`n$script:kimiUnmarkedHooks"
+            if ($flag -ne "-Install") { Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null }
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @($flag)
+            # stderr, because uninstall.ps1 throws the adapter's stdout away.
+            $result.Stderr | Should -Match 'has 1 hook command\(s\) outside the peon-ping block'
+            $result.Stdout | Should -Not -Match 'outside the peon-ping block'
+            (Get-KimiConfigText $config) | Should -Match ([regex]::Escape($script:kimiUnmarkedHooks))
+        }
+
+        It "warns on -Uninstall even with no block to remove" {
+            $config = New-KimiConfig $script:kimiUnmarkedHooks
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Uninstall")
+            $result.ExitCode | Should -Be 0
+            $result.Stdout | Should -Match 'Nothing to remove'
+            $result.Stderr | Should -Match 'outside the peon-ping block'
+        }
+
+        It "sees a Windows adapter path too" {
+            $config = New-KimiConfig "[[hooks]]`nevent = ""Stop""`ncommand = 'powershell -NoProfile -File ""C:\Users\u\.claude\hooks\peon-ping\adapters\kimi.ps1""'`n"
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Status")
+            $result.Stderr | Should -Match 'has 1 hook command\(s\)'
+        }
+
+        It "does not warn when the only adapter hooks are its own" {
+            $config = New-KimiConfig "# the old adapters/kimi.sh hook was removed`ndefault_model = ""x""`n"
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install")
+            $result.Stderr | Should -Not -Match 'outside the peon-ping block'
+            $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Status")
+            $result.Stderr | Should -Not -Match 'outside the peon-ping block'
+        }
     }
 
     It "reports the registered event count via -Status" {
@@ -746,13 +1027,13 @@ Describe "Category B: Kimi Adapter" {
         Invoke-KimiAdapter -Config $config -AdapterArgs @("-Install") | Out-Null
         $result = Invoke-KimiAdapter -Config $config -AdapterArgs @("-Status")
         $result.ExitCode | Should -Be 0
-        $result.Output | Should -Match '\(11 events\)'
+        $result.Stdout | Should -Match '\(11 events\)'
     }
 
     It "exits non-zero from -Status when nothing is registered" {
         $result = Invoke-KimiAdapter -Config (New-KimiConfig "default_model = ""x""`n") -AdapterArgs @("-Status")
         $result.ExitCode | Should -Be 1
-        $result.Output | Should -Match 'not registered'
+        $result.Stdout | Should -Match 'not registered'
     }
 
     It "reports rather than silently failing when peon.ps1 is missing" {
@@ -778,6 +1059,158 @@ Describe "Category B: Kimi Adapter" {
         } finally {
             Remove-Item Env:\CLAUDE_PEON_DIR -ErrorAction SilentlyContinue
         }
+    }
+}
+
+Describe "uninstall.ps1 Kimi hooks" {
+    BeforeAll {
+        # A whole fake profile: uninstall.ps1 resolves everything from
+        # USERPROFILE and from the install dir it runs out of.
+        $script:uninstallSandbox = Join-Path ([System.IO.Path]::GetTempPath()) "peon uninstall-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $script:uninstallSource = Join-Path $script:RepoRoot "uninstall.ps1"
+        $script:kimiAdapterSource = Join-Path $script:AdaptersDir "kimi.ps1"
+
+        function New-UninstallProfile {
+            param([switch]$WithoutAdapter)
+            $profileDir = Join-Path $script:uninstallSandbox ([guid]::NewGuid().ToString('N').Substring(0, 8))
+            $installDir = Join-Path $profileDir ".claude\hooks\peon-ping"
+            New-Item -ItemType Directory -Path (Join-Path $installDir "adapters"), (Join-Path $profileDir ".kimi-code"), (Join-Path $profileDir ".kimi") -Force | Out-Null
+            Set-Content -Path (Join-Path $installDir "peon.ps1") -Value "exit 0" -Encoding UTF8
+            Copy-Item $script:uninstallSource (Join-Path $installDir "uninstall.ps1")
+            Copy-Item $script:kimiAdapterSource (Join-Path $installDir "adapters\kimi.ps1")
+            return [PSCustomObject]@{
+                Profile   = $profileDir
+                Install   = $installDir
+                Adapter   = Join-Path $installDir "adapters\kimi.ps1"
+                KimiCode  = Join-Path $profileDir ".kimi-code\config.toml"
+                KimiCli   = Join-Path $profileDir ".kimi\config.toml"
+            }
+        }
+
+        function Set-ProfileConfig([string]$Path, [string]$Body) {
+            [System.IO.File]::WriteAllText($Path, $Body, (New-Object System.Text.UTF8Encoding $false))
+        }
+
+        function Install-KimiBlock($ProfileInfo, [string]$Config) {
+            $env:KIMI_CONFIG = $Config
+            try { & powershell -NoProfile -NonInteractive -File $ProfileInfo.Adapter -Install *>$null }
+            finally { Remove-Item Env:\KIMI_CONFIG -ErrorAction SilentlyContinue }
+        }
+
+        function Invoke-Uninstall($ProfileInfo) {
+            $savedProfile = $env:USERPROFILE
+            $env:USERPROFILE = $ProfileInfo.Profile
+            try {
+                $out = & powershell -NoProfile -NonInteractive -File (Join-Path $ProfileInfo.Install "uninstall.ps1") -Force 2>&1
+                return [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Output = ($out | Out-String) }
+            } finally {
+                $env:USERPROFILE = $savedProfile
+            }
+        }
+
+        $script:uninstallUnmarked = "[[hooks]]`nevent = ""Stop""`ncommand = ""bash '/home/u/.claude/hooks/peon-ping/adapters/kimi.sh'""`ntimeout = 10`n"
+    }
+
+    AfterAll {
+        if ($script:uninstallSandbox -and (Test-Path $script:uninstallSandbox)) {
+            Remove-Item $script:uninstallSandbox -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "restores a Kimi config without a final newline byte for byte" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode "default_model = ""x"""
+        $before = [System.IO.File]::ReadAllBytes($p.KimiCode)
+        Install-KimiBlock $p $p.KimiCode
+
+        $result = Invoke-Uninstall $p
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'Removed Kimi Code hooks from'
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($p.KimiCode)) | Should -Be ([Convert]::ToBase64String($before))
+        Test-Path $p.Install | Should -BeFalse
+    }
+
+    It "warns about unmarked Kimi hooks in a config with no block" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode $script:uninstallUnmarked
+        $result = Invoke-Uninstall $p
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'has 1 hook command\(s\) outside the peon-ping block'
+        $result.Output | Should -Match 'No peon-ping Kimi Code hooks found'
+    }
+
+    It "warns about unmarked Kimi hooks while removing the block elsewhere" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode "default_model = ""x""`n"
+        Install-KimiBlock $p $p.KimiCode
+        Set-ProfileConfig $p.KimiCli $script:uninstallUnmarked
+
+        $result = Invoke-Uninstall $p
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match ([regex]::Escape("Removed Kimi Code hooks from $($p.KimiCode)"))
+        $result.Output | Should -Match ([regex]::Escape("$($p.KimiCli) has 1 hook command(s)"))
+    }
+
+    It "passes on the adapter's warning for unmarked hooks next to the block" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode "default_model = ""x""`n`n$script:uninstallUnmarked"
+        Install-KimiBlock $p $p.KimiCode
+
+        $result = Invoke-Uninstall $p
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Match 'Removed Kimi Code hooks from'
+        $result.Output | Should -Match 'outside the peon-ping block'
+        (Get-Content -LiteralPath $p.KimiCode -Raw) | Should -Not -Match 'peon-ping Kimi hooks begin'
+    }
+
+    It "stops before deleting the adapter when the Kimi config cannot be written" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode "default_model = ""x"""
+        Install-KimiBlock $p $p.KimiCode
+        $before = [System.IO.File]::ReadAllBytes($p.KimiCode)
+        (Get-Item -LiteralPath $p.KimiCode).IsReadOnly = $true
+        try {
+            $result = Invoke-Uninstall $p
+            $result.ExitCode | Should -Be 1
+            $result.Output | Should -Match 'could not remove Kimi Code hooks'
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($p.KimiCode)) | Should -Be ([Convert]::ToBase64String($before))
+            # The hooks still run the adapter, so it has to stay.
+            Test-Path $p.Adapter | Should -BeTrue
+        } finally {
+            (Get-Item -LiteralPath $p.KimiCode).IsReadOnly = $false
+        }
+    }
+
+    It "stops before deleting the adapter when the Kimi config cannot be read" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode "default_model = ""x"""
+        Install-KimiBlock $p $p.KimiCode
+        # An exclusive handle stands in for a config another program has locked.
+        $lock = [System.IO.File]::Open($p.KimiCode, 'Open', 'ReadWrite', 'None')
+        try {
+            $result = Invoke-Uninstall $p
+            $result.ExitCode | Should -Be 1
+            $result.Output | Should -Match 'cannot read Kimi config'
+            Test-Path $p.Adapter | Should -BeTrue
+        } finally {
+            $lock.Dispose()
+        }
+        (Get-Content -LiteralPath $p.KimiCode -Raw) | Should -Match 'peon-ping Kimi hooks begin'
+    }
+
+    It "stops instead of guessing at the Kimi block when the adapter is gone" {
+        $p = New-UninstallProfile
+        Set-ProfileConfig $p.KimiCode "default_model = ""x"""
+        Install-KimiBlock $p $p.KimiCode
+        $before = [System.IO.File]::ReadAllBytes($p.KimiCode)
+        Remove-Item $p.Adapter -Force
+
+        $result = Invoke-Uninstall $p
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -Match 'adapters\\kimi\.ps1 is missing'
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($p.KimiCode)) | Should -Be ([Convert]::ToBase64String($before))
+        # Nothing deleted yet, so reinstalling and uninstalling again still works.
+        Test-Path $p.Install | Should -BeTrue
     }
 }
 

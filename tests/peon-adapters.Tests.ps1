@@ -746,6 +746,30 @@ Describe "Functional: kimi.ps1 hook event mapping" {
         $json.error | Should -Not -Match '@\{'
     }
 
+    It "forwards a non-ASCII cwd and session title to peon.ps1 intact" {
+        # Windows PowerShell 5.1 pipes to a native process in $OutputEncoding,
+        # ASCII by default, which would turn both into "??". Write the payload as
+        # raw UTF-8 bytes the way Kimi does -- piping it from here would garble it
+        # before the adapter ever saw it.
+        $adapter = Join-Path $script:AdaptersDir "kimi.ps1"
+        $chinese = "$([char]0x4E2D)$([char]0x6587)"
+        $payload = @{ hook_event_name = "Stop"; session_id = "session_a1"; cwd = "C:\$chinese"; session_title = "$chinese title" } |
+            ConvertTo-Json -Compress
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell", "-NoProfile -NonInteractive -File `"$adapter`""
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($payload)
+        $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $proc.StandardInput.Close()
+        $proc.WaitForExit(30000) | Out-Null
+
+        $json = Get-PeonInputLog $script:testDir
+        $json.cwd | Should -Be "C:\$chinese"
+        $json.transcript_summary | Should -Be "$chinese title"
+    }
+
     It "attributes a StopFailure with no tool to Bash so task.error sounds" {
         $adapter = Join-Path $script:AdaptersDir "kimi.ps1"
         '{"hook_event_name":"StopFailure","session_id":"session_a1"}' |

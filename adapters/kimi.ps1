@@ -11,10 +11,11 @@
 # Docs: https://moonshotai.github.io/kimi-code/en/customization/hooks
 #
 # Usage:
-#   powershell -NoProfile -File adapters/kimi.ps1 -Install     Register hooks
-#   powershell -NoProfile -File adapters/kimi.ps1 -Uninstall   Remove them
-#   powershell -NoProfile -File adapters/kimi.ps1 -Status      Report state
-#   powershell -NoProfile -File adapters/kimi.ps1              Hook mode (stdin)
+#   powershell -NoProfile -File adapters/kimi.ps1 -Install       Register hooks
+#   powershell -NoProfile -File adapters/kimi.ps1 -Uninstall     Remove them
+#   powershell -NoProfile -File adapters/kimi.ps1 -Status        Report state
+#   powershell -NoProfile -File adapters/kimi.ps1 -StopWatcher   Only reap the old daemon
+#   powershell -NoProfile -File adapters/kimi.ps1                Hook mode (stdin)
 #
 # -Install and -Uninstall also reap the watcher daemon this adapter used to be,
 # so updating from v2.37.0 or earlier does not leave it running.
@@ -27,6 +28,7 @@ param(
     [switch]$Install,
     [switch]$Uninstall,
     [switch]$Status,
+    [switch]$StopWatcher,
     [switch]$Help
 )
 
@@ -34,11 +36,13 @@ $ErrorActionPreference = "SilentlyContinue"
 
 # --- Locations ---------------------------------------------------------------
 
+$SelfPath = $MyInvocation.MyCommand.Path
+
 # Prefer the env var, then this script's own install root (adapters/..), so a
 # non-default install keeps working without embedding env vars in the TOML.
 $PeonDir = $env:CLAUDE_PEON_DIR
 if (-not $PeonDir) {
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $SelfPath
     if ($scriptDir) { $PeonDir = Split-Path -Parent $scriptDir }
 }
 if (-not $PeonDir) { $PeonDir = Join-Path $env:USERPROFILE ".claude\hooks\peon-ping" }
@@ -64,18 +68,23 @@ if (-not $KimiConfig) { $KimiConfig = Join-Path $KimiDir "config.toml" }
 
 $BeginMarker = "# peon-ping Kimi hooks begin"
 $EndMarker   = "# peon-ping Kimi hooks end"
+# Appended to the begin marker when -Install had to terminate the config's last
+# line before it could add the block, so -Uninstall knows to take that newline
+# back. Without it "a" and "a`n" install to the same bytes. Shared with kimi.sh,
+# so either adapter can remove a block the other wrote.
+$EofNote = "(newline added at end of file)"
 
 # Leftovers from the watcher daemon this adapter replaced. See
 # Stop-LegacyWatcher below.
 $LegacyPidFile = Join-Path $PeonDir ".kimi-adapter.pid"
 $LegacyLogFile = Join-Path $PeonDir ".kimi-adapter.log"
 
-# Events peon-ping registers, out of the sixteen in Kimi's HOOK_EVENT_TYPES.
-# PreToolUse/PostToolUse fire on every tool call, PostCompact duplicates
-# PreCompact, and Interrupt/Notification have no CESP category, so those five
-# stay unregistered. PermissionResult is registered but silent: it maps to
-# PreToolUse so the tab title stops saying "needs approval" once the prompt is
-# answered.
+# Events peon-ping registers, out of the sixteen in Kimi Code's
+# HOOK_EVENT_TYPES. PreToolUse/PostToolUse fire on every tool call, PostCompact
+# duplicates PreCompact, and Interrupt/Notification have no CESP category, so
+# those five stay unregistered. PermissionResult is registered but silent: it
+# maps to PreToolUse so the tab title stops saying "needs approval" once the
+# prompt is answered.
 $HookEvents = @(
     "SessionStart",
     "SessionEnd",
@@ -89,6 +98,39 @@ $HookEvents = @(
     "SubagentStop",
     "PreCompact"
 )
+
+# The older kimi-cli (~/.kimi) has hooks from 1.28.0 on, but its schema has
+# thirteen events and none of these. It validates `event` against that list
+# and refuses to load a config.toml naming any other, so registering them
+# would stop kimi-cli from starting at all. Only Kimi Code's own home is known
+# to take the full list; every other config gets the events both accept.
+# Kimi Code can also be moved off ~/.kimi-code with KIMI_CODE_HOME.
+$KimiCodeOnlyEvents = @("PermissionRequest", "PermissionResult")
+
+function Get-FullPath([string]$path) {
+    try { return [System.IO.Path]::GetFullPath($path).TrimEnd('\', '/') } catch { return $path }
+}
+
+$KimiConfigDir = Split-Path -Parent $KimiConfig
+$isKimiCode = (Split-Path -Leaf $KimiConfigDir) -eq ".kimi-code"
+if (-not $isKimiCode -and $env:KIMI_CODE_HOME) {
+    # -eq is case-insensitive, as the file system is.
+    $isKimiCode = (Get-FullPath $KimiConfigDir) -eq (Get-FullPath $env:KIMI_CODE_HOME)
+}
+if ($isKimiCode) {
+    $KimiTarget = "Kimi Code"
+    $RegisterEvents = $HookEvents
+} else {
+    $KimiTarget = "kimi-cli"
+    $RegisterEvents = @($HookEvents | Where-Object { $KimiCodeOnlyEvents -notcontains $_ })
+}
+
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+function Write-Warn([string]$message) {
+    # stderr: uninstall.ps1 discards the adapter's stdout.
+    [Console]::Error.WriteLine("! $message")
+}
 
 function Get-Field($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
@@ -114,77 +156,240 @@ function Get-ErrorText($value) {
     return ($text -replace '\s+', ' ').Trim()
 }
 
+# --- Legacy watcher ------------------------------------------------------------
+
+function Split-CommandLine([string]$commandLine) {
+    # Windows hands a process one command-line string, not an argv array; split
+    # it the way the C runtime does, so argument boundaries are the real ones
+    # rather than wherever a space happens to fall.
+    if (-not ('PeonPing.KimiNative' -as [type])) {
+        Add-Type -Namespace PeonPing -Name KimiNative -MemberDefinition @'
+[DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern IntPtr CommandLineToArgvW(string lpCmdLine, out int pNumArgs);
+[DllImport("kernel32.dll")]
+public static extern IntPtr LocalFree(IntPtr hMem);
+'@
+    }
+    $argc = 0
+    $argvPtr = [PeonPing.KimiNative]::CommandLineToArgvW($commandLine, [ref]$argc)
+    if ($argvPtr -eq [IntPtr]::Zero) { return ,@() }
+    try {
+        $argv = New-Object string[] $argc
+        for ($i = 0; $i -lt $argc; $i++) {
+            $argPtr = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($argvPtr, $i * [IntPtr]::Size)
+            $argv[$i] = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($argPtr)
+        }
+        return ,$argv
+    } finally {
+        [PeonPing.KimiNative]::LocalFree($argvPtr) | Out-Null
+    }
+}
+
+function Test-WatcherScript([string]$path) {
+    # Whether $path names this install's adapter. The watcher was launched with
+    # $MyInvocation.MyCommand.Path, which is always absolute, so a relative path
+    # is not it.
+    if (-not $path -or -not [System.IO.Path]::IsPathRooted($path)) { return $false }
+    $full = Get-FullPath $path
+    foreach ($candidate in @((Join-Path $PeonDir "adapters\kimi.ps1"), $SelfPath)) {
+        if ($candidate -and $full -eq (Get-FullPath $candidate)) { return $true }
+    }
+    return $false
+}
+
+function Test-LegacyWatcher($proc) {
+    # The watcher was started as
+    #   Start-Process powershell -ArgumentList "-NoProfile", "-File", "<adapter>"
+    # so its argv is exactly (powershell, -NoProfile, -File, <adapter>), and
+    # <adapter> has to be this install's. A process that merely is PowerShell, or
+    # mentions kimi.ps1 -- another session, another install, this adapter run as
+    # a hook or with a switch -- does not qualify.
+    # The executable, unlike argv[0], is not the parent's choice. The watcher
+    # always ran under Windows PowerShell, and a process whose executable or
+    # command line cannot be read (another user's, an elevated one) cannot be
+    # verified, so it is left alone.
+    if (-not $proc.ExecutablePath -or (Split-Path -Leaf $proc.ExecutablePath) -ne "powershell.exe") { return $false }
+    if (-not $proc.CommandLine) { return $false }
+    $argv = Split-CommandLine $proc.CommandLine
+    if ($argv.Count -ne 4) { return $false }
+    if ((Split-Path -Leaf $argv[0]) -notmatch '^powershell(\.exe)?$') { return $false }
+    if ($argv[1] -ne "-NoProfile" -or $argv[2] -ne "-File") { return $false }
+    return (Test-WatcherScript $argv[3])
+}
+
 function Stop-LegacyWatcher {
     # Up to v2.37.0 this adapter was a filesystem watcher daemon holding a
     # pidfile. An update only replaces the script on disk, so that process
     # survives it and keeps piping its own events to peon.ps1 -- every sound
     # twice once the hooks are live. Reap it before registering them.
-    if (-not (Test-Path $LegacyPidFile)) {
-        Remove-Item $LegacyLogFile -Force -ErrorAction SilentlyContinue
-        return
-    }
-
-    $stopped = $false
-    $pidText = (Get-Content -LiteralPath $LegacyPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-    $legacyPid = 0
-    if ([int]::TryParse("$pidText".Trim(), [ref]$legacyPid) -and $legacyPid -gt 0) {
-        $proc = Get-Process -Id $legacyPid -ErrorAction SilentlyContinue
-        # A pid outlives the process that wrote it, so only stop one that still
-        # looks like the watcher rather than whatever inherited the number.
-        if ($proc -and $proc.ProcessName -match '^(powershell|pwsh)$') {
-            Stop-Process -Id $legacyPid -Force -ErrorAction SilentlyContinue
-            $stopped = $true
+    if (Test-Path -LiteralPath $LegacyPidFile) {
+        $stopped = $false
+        $pidText = (Get-Content -LiteralPath $LegacyPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $legacyPid = 0
+        if ([int]::TryParse("$pidText".Trim(), [ref]$legacyPid) -and $legacyPid -gt 0 -and $legacyPid -ne $PID) {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $legacyPid" -ErrorAction SilentlyContinue
+            if ($proc) {
+                # A pid outlives the process that wrote it, so only stop the
+                # watcher itself, never whatever inherited the number.
+                if (Test-LegacyWatcher $proc) {
+                    Get-CimInstance Win32_Process -Filter "ParentProcessId = $legacyPid" -ErrorAction SilentlyContinue |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    Stop-Process -Id $legacyPid -Force -ErrorAction SilentlyContinue
+                    $stopped = $true
+                } elseif ("$($proc.CommandLine)" -match '(?i)kimi\.ps1') {
+                    Write-Warn "PID $legacyPid may be the old Kimi watcher, but its command line could not be verified; left it running."
+                    Write-Warn "If it is, stop it with: Stop-Process -Id $legacyPid"
+                }
+            }
+        }
+        Remove-Item -LiteralPath $LegacyPidFile -Force -ErrorAction SilentlyContinue
+        if ($stopped) {
+            Write-Host "Stopped the old Kimi watcher daemon (native hooks replace it)"
         }
     }
+    Remove-Item -LiteralPath $LegacyLogFile -Force -ErrorAction SilentlyContinue
+}
 
-    Remove-Item $LegacyPidFile -Force -ErrorAction SilentlyContinue
-    Remove-Item $LegacyLogFile -Force -ErrorAction SilentlyContinue
-    if ($stopped) {
-        Write-Host "Stopped the old Kimi watcher daemon (native hooks replace it)"
+# --- Config editing ------------------------------------------------------------
+#
+# The config is handled as bytes, never decoded and re-encoded: only the
+# managed block is ours, and everything around it -- non-ASCII text in any
+# encoding, a BOM, whitespace-only lines inside multiline strings, CRs, a
+# missing final newline -- has to come back exactly as it was. The markers are
+# ASCII, so finding them in the bytes is enough.
+
+function Exit-ConfigError([string]$message) {
+    # $ErrorActionPreference is SilentlyContinue for hook mode, which would let a
+    # failed read or write fall through to a success message and exit 0 --
+    # uninstall.ps1 would then delete the adapter the hooks still point at.
+    [Console]::Error.WriteLine("x $message")
+    exit 1
+}
+
+function Read-ConfigBytes([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return ,([byte[]]@()) }
+    try {
+        return ,([System.IO.File]::ReadAllBytes($path))
+    } catch {
+        Exit-ConfigError "Could not read ${path}: $($_.Exception.InnerException.Message)"
     }
 }
 
-function Get-StrippedConfig([string]$path) {
-    # Return the config's lines with any previously installed block removed,
-    # marker lines included.
-    if (-not (Test-Path $path)) { return @() }
-    $kept = New-Object System.Collections.Generic.List[string]
-    $skip = $false
-    foreach ($line in (Get-Content -LiteralPath $path)) {
-        if ($line.StartsWith($BeginMarker)) {
-            # -Install writes exactly one blank separator line ahead of the
-            # marker, so take that one back with the block -- and only that one,
-            # or -Uninstall would eat a blank line the config already had.
-            if ($kept.Count -gt 0 -and [string]::IsNullOrWhiteSpace($kept[$kept.Count - 1])) {
-                $kept.RemoveAt($kept.Count - 1)
-            }
-            $skip = $true
+function Get-ConfigLines([byte[]]$bytes) {
+    # Lines as awk sees them in kimi.sh: split on LF, the LF dropped, a CR kept.
+    $lines = New-Object System.Collections.Generic.List[object]
+    $start = 0
+    while ($start -lt $bytes.Length) {
+        $lf = [Array]::IndexOf($bytes, [byte]10, $start)
+        $stop = if ($lf -ge 0) { $lf } else { $bytes.Length }
+        $lines.Add([PSCustomObject]@{
+            Start = $start
+            Next  = if ($lf -ge 0) { $lf + 1 } else { $bytes.Length }
+            Text  = $Utf8NoBom.GetString($bytes, $start, $stop - $start)
+        })
+        $start = $stop + 1
+    }
+    return ,$lines
+}
+
+function Find-KimiBlock([byte[]]$bytes) {
+    # Locate the managed block: State is "none", "open" (a begin marker with no
+    # end marker after it) or "found". For a found block, KeepBytes is where the
+    # bytes ahead of it end -- before the blank separator line -Install writes,
+    # if it is there -- and TailStart where the bytes after its end marker begin.
+    $lines = Get-ConfigLines $bytes
+    $begin = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($begin -lt 0) {
+            if ($lines[$i].Text.StartsWith($BeginMarker)) { $begin = $i }
             continue
         }
+        if ($lines[$i].Text.StartsWith($EndMarker)) {
+            $beginText = $lines[$begin].Text
+            $sep = $begin -gt 0 -and ($lines[$begin - 1].Text -eq "" -or $lines[$begin - 1].Text -eq "`r")
+            return [PSCustomObject]@{
+                State     = "found"
+                KeepBytes = if ($sep) { $lines[$begin - 1].Start } else { $lines[$begin].Start }
+                TailStart = $lines[$i].Next
+                Eof       = $beginText.Contains($EofNote)
+                Crlf      = $beginText.EndsWith("`r")
+            }
+        }
+    }
+    return [PSCustomObject]@{ State = $(if ($begin -ge 0) { "open" } else { "none" }) }
+}
+
+function Join-Bytes([byte[]]$bytes, [int]$length, [byte[]]$tail) {
+    $out = New-Object byte[] ($length + $tail.Length)
+    [Array]::Copy($bytes, 0, $out, 0, $length)
+    [Array]::Copy($tail, 0, $out, $length, $tail.Length)
+    return ,$out
+}
+
+function Remove-KimiBlock([byte[]]$bytes) {
+    # Return the config with the managed block removed, along with the separator
+    # and EOF newline -Install added for it, and every other byte untouched.
+    # $null for an unterminated block, rather than guess where it ends.
+    $block = Find-KimiBlock $bytes
+    if ($block.State -eq "none") { return ,$bytes }
+    if ($block.State -eq "open") { return $null }
+
+    $tailLength = $bytes.Length - $block.TailStart
+    $tail = New-Object byte[] $tailLength
+    [Array]::Copy($bytes, $block.TailStart, $tail, 0, $tailLength)
+
+    # Only take the EOF newline back if the block is still last in the file:
+    # anything appended after it needs that newline to stay on its own line.
+    $keep = $block.KeepBytes
+    if ($block.Eof -and $keep -gt 0 -and $tailLength -eq 0) {
+        $keep -= $(if ($block.Crlf) { 2 } else { 1 })
+    }
+    return ,(Join-Bytes $bytes $keep $tail)
+}
+
+function Write-ConfigBytes([string]$path, [byte[]]$bytes) {
+    # WriteAllBytes truncates and writes through the existing file instead of
+    # replacing it, so its ACL, attributes and any symlink survive.
+    try {
+        [System.IO.File]::WriteAllBytes($path, $bytes)
+    } catch {
+        Exit-ConfigError "Could not write ${path}: $($_.Exception.InnerException.Message)"
+    }
+}
+
+function Test-HasBlock([string]$path) {
+    # Through Read-ConfigBytes, so an unreadable config fails loudly instead of
+    # passing for one without a block.
+    $bytes = Read-ConfigBytes $path
+    return $Utf8NoBom.GetString($bytes).Contains($BeginMarker)
+}
+
+function Get-UnmanagedHookCount([string]$path) {
+    # Count lines outside the managed block that run this adapter. Kimi Code's
+    # kimi-cli migration copies [[hooks]] from ~/.kimi/config.toml into its own
+    # config by re-serializing them, which drops our markers, so a block from a
+    # kimi-cli install can come back unmarked next to the one -Install writes.
+    # Only the marked block is ours to edit; these are reported, not touched.
+    # Kept in sync with count_unmanaged_hooks in kimi.sh.
+    $n = 0
+    $skip = $false
+    foreach ($line in [System.IO.File]::ReadAllLines($path, $Utf8NoBom)) {
+        if ($line.StartsWith($BeginMarker)) { $skip = $true; continue }
         if ($line.StartsWith($EndMarker))   { $skip = $false; continue }
-        if (-not $skip) { $kept.Add($line) }
+        if ($skip -or $line -match '^\s*#') { continue }
+        if ($line -match 'adapters[\\/]+kimi\.(sh|ps1)') { $n++ }
     }
-    return $kept.ToArray()
+    return $n
 }
 
-function Get-ConfigNewline([string]$path) {
-    # Kimi writes config.toml from Node, so the file may well be LF even on
-    # Windows. Rewriting it wholesale in CRLF would touch every line, so keep
-    # whatever the file already uses.
-    if (Test-Path $path) {
-        $raw = [System.IO.File]::ReadAllText($path)
-        if ($raw.Contains("`r`n")) { return "`r`n" }
-        if ($raw.Contains("`n"))   { return "`n" }
-    }
-    return [Environment]::NewLine
-}
-
-function Write-ConfigLines([string]$path, [string[]]$lines, [string]$newline) {
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    # No lines means the config held nothing but our block: leave it empty
-    # rather than writing a lone newline into it.
-    $text = if ($lines.Count -gt 0) { ($lines -join $newline) + $newline } else { "" }
-    [System.IO.File]::WriteAllText($path, $text, $utf8NoBom)
+function Show-UnmanagedHooks {
+    if (-not (Test-Path -LiteralPath $KimiConfig)) { return }
+    $n = Get-UnmanagedHookCount $KimiConfig
+    if ($n -le 0) { return }
+    Write-Warn "$KimiConfig has $n hook command(s) outside the peon-ping block that run the Kimi adapter."
+    Write-Warn "Kimi Code's migration from kimi-cli copies hooks without the block markers, so these"
+    Write-Warn "were likely carried over from ~/.kimi. Alongside the block they can make events fire"
+    Write-Warn "twice, and uninstalling peon-ping leaves them behind. Remove those [[hooks]] entries by hand."
 }
 
 function ConvertTo-TomlString([string]$value) {
@@ -201,44 +406,60 @@ function ConvertTo-TomlString([string]$value) {
 # --- Management modes --------------------------------------------------------
 
 if ($Help) {
-    Write-Host "Usage: powershell -NoProfile -File kimi.ps1 [-Install|-Uninstall|-Status]"
+    Write-Host "Usage: powershell -NoProfile -File kimi.ps1 [-Install|-Uninstall|-Status|-StopWatcher]"
     Write-Host ""
-    Write-Host "  -Install     Register peon-ping hooks in $KimiConfig"
-    Write-Host "  -Uninstall   Remove them"
-    Write-Host "  -Status      Report whether they are registered"
-    Write-Host "  (no args)    Hook mode: read one Kimi event as JSON on stdin and forward it"
+    Write-Host "  -Install       Register peon-ping hooks in $KimiConfig"
+    Write-Host "  -Uninstall     Remove them"
+    Write-Host "  -Status        Report whether they are registered"
+    Write-Host "  -StopWatcher   Only stop the watcher daemon this adapter used to be"
+    Write-Host "  (no args)      Hook mode: read one Kimi event as JSON on stdin and forward it"
     exit 0
 }
 
 if ($Status) {
-    if ((Test-Path $KimiConfig) -and (Select-String -LiteralPath $KimiConfig -SimpleMatch $BeginMarker -Quiet)) {
+    if (Test-HasBlock $KimiConfig) {
         $count = 0
         $inBlock = $false
-        foreach ($line in (Get-Content -LiteralPath $KimiConfig)) {
+        foreach ($line in [System.IO.File]::ReadAllLines($KimiConfig, $Utf8NoBom)) {
             if ($line.StartsWith($BeginMarker)) { $inBlock = $true; continue }
             if ($line.StartsWith($EndMarker))   { $inBlock = $false; continue }
             if ($inBlock -and $line.StartsWith("event = ")) { $count++ }
         }
         Write-Host "peon-ping hooks registered in $KimiConfig ($count events)"
+        Show-UnmanagedHooks
         exit 0
     }
     Write-Host "peon-ping hooks not registered in $KimiConfig"
+    Show-UnmanagedHooks
     exit 1
+}
+
+if ($StopWatcher) {
+    # For uninstall.ps1, which handles each config itself but still has to reap
+    # a daemon left by an install that never registered hooks.
+    Stop-LegacyWatcher
+    exit 0
 }
 
 if ($Uninstall) {
     Stop-LegacyWatcher
-    if (-not (Test-Path $KimiConfig)) {
+    if (-not (Test-Path -LiteralPath $KimiConfig)) {
         Write-Host "Nothing to remove ($KimiConfig does not exist)."
         exit 0
     }
-    if (-not (Select-String -LiteralPath $KimiConfig -SimpleMatch $BeginMarker -Quiet)) {
+    if (-not (Test-HasBlock $KimiConfig)) {
         Write-Host "Nothing to remove (no peon-ping block found)."
+        Show-UnmanagedHooks
         exit 0
     }
-    $nl = Get-ConfigNewline $KimiConfig
-    Write-ConfigLines $KimiConfig (Get-StrippedConfig $KimiConfig) $nl
+    $stripped = Remove-KimiBlock (Read-ConfigBytes $KimiConfig)
+    if ($null -eq $stripped) {
+        [Console]::Error.WriteLine("x $KimiConfig has `"$BeginMarker`" without `"$EndMarker`"; fix it by hand.")
+        exit 1
+    }
+    Write-ConfigBytes $KimiConfig $stripped
     Write-Host "Removed peon-ping hooks from $KimiConfig"
+    Show-UnmanagedHooks
     exit 0
 }
 
@@ -252,14 +473,20 @@ if ($Install) {
     Stop-LegacyWatcher
     if (-not (Test-Path $KimiDir)) { New-Item -ItemType Directory -Path $KimiDir -Force | Out-Null }
 
-    $adapterPath = $MyInvocation.MyCommand.Path
+    $adapterPath = $SelfPath
     if (-not $adapterPath) { $adapterPath = Join-Path $PeonDir "adapters\kimi.ps1" }
 
-    $nl = Get-ConfigNewline $KimiConfig
-
     # Rewriting from scratch keeps -Install idempotent.
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($line in (Get-StrippedConfig $KimiConfig)) { $lines.Add($line) }
+    $stripped = Remove-KimiBlock (Read-ConfigBytes $KimiConfig)
+    if ($null -eq $stripped) {
+        [Console]::Error.WriteLine("x $KimiConfig has `"$BeginMarker`" without `"$EndMarker`"; fix it by hand.")
+        exit 1
+    }
+
+    # Match the config's line endings so a CRLF file stays CRLF. Kimi writes it
+    # from Node, so a fresh one is LF even on Windows.
+    $nl = "`n"
+    if ([System.Text.Encoding]::ASCII.GetString($stripped) -match "`r(`n|$)") { $nl = "`r`n" }
 
     # Kimi spawns the hook with Node's `shell: true`, which on Windows means
     # `cmd.exe /d /s /c "<command>"`. cmd splits on spaces, so the adapter path
@@ -267,27 +494,47 @@ if ($Install) {
     # never starts.
     $command = "powershell -NoProfile -NonInteractive -File `"$adapterPath`""
 
-    $lines.Add("")
-    $lines.Add($BeginMarker)
-    $lines.Add("# install_dir = $PeonDir")
-    foreach ($ev in $HookEvents) {
-        $lines.Add("")
-        $lines.Add("[[hooks]]")
-        $lines.Add("event = `"$ev`"")
-        $lines.Add("command = $(ConvertTo-TomlString $command)")
-        $lines.Add("timeout = 10")
+    $block = New-Object System.Text.StringBuilder
+    $beginLine = $BeginMarker
+    # Separate the block from existing content with one blank line, but do not
+    # open an empty config with one. A last line without a newline has to be
+    # terminated first; $EofNote records that for -Uninstall.
+    if ($stripped.Length -gt 0) {
+        if ($stripped[$stripped.Length - 1] -ne 10) {
+            [void]$block.Append($nl)
+            $beginLine = "$BeginMarker $EofNote"
+        }
+        [void]$block.Append($nl)
     }
-    $lines.Add("")
-    $lines.Add($EndMarker)
+    [void]$block.Append("$beginLine$nl")
+    [void]$block.Append("# install_dir = $PeonDir$nl")
+    foreach ($ev in $RegisterEvents) {
+        [void]$block.Append("$nl[[hooks]]$nl")
+        [void]$block.Append("event = `"$ev`"$nl")
+        [void]$block.Append("command = $(ConvertTo-TomlString $command)$nl")
+        [void]$block.Append("timeout = 10$nl")
+    }
+    [void]$block.Append("$nl$EndMarker$nl")
 
-    Write-ConfigLines $KimiConfig $lines.ToArray() $nl
+    $blockBytes = $Utf8NoBom.GetBytes($block.ToString())
+    Write-ConfigBytes $KimiConfig (Join-Bytes $stripped $stripped.Length $blockBytes)
 
-    Write-Host "peon-ping hooks registered for Kimi Code"
+    Write-Host "peon-ping hooks registered for $KimiTarget"
     Write-Host "  config:  $KimiConfig"
     Write-Host "  adapter: $adapterPath"
-    Write-Host "  events:  $($HookEvents -join ' ')"
+    Write-Host "  events:  $($RegisterEvents -join ' ')"
+    if ($RegisterEvents.Count -lt $HookEvents.Count) {
+        Write-Warn "Left out $($KimiCodeOnlyEvents -join ' '): only Kimi Code (~/.kimi-code) has them,"
+        Write-Warn "and the older kimi-cli refuses to start with a config that names them."
+        Write-Warn "Approval prompts stay silent until you move to Kimi Code."
+    }
+    Show-UnmanagedHooks
     Write-Host ""
-    Write-Host "Run 'kimi doctor' to validate, then restart Kimi Code."
+    if ($KimiTarget -eq "Kimi Code") {
+        Write-Host "Run 'kimi doctor' to validate, then restart Kimi Code."
+    } else {
+        Write-Host "Restart kimi-cli (1.28.0 or later; earlier versions have no hooks)."
+    }
     exit 0
 }
 
@@ -378,6 +625,11 @@ $title = "$(Get-Field $inputJson 'session_title')"
 if ($title) { $payload["transcript_summary"] = $title.Substring(0, [Math]::Min(120, $title.Length)) }
 
 $payloadJson = $payload | ConvertTo-Json -Compress
+
+# Windows PowerShell 5.1 pipes to a native process in $OutputEncoding, which
+# defaults to ASCII and turns a Chinese cwd or session title into "??".
+# peon.ps1 reads its stdin as UTF-8, so send exactly that, without a BOM.
+$OutputEncoding = $Utf8NoBom
 
 # stdout is swallowed: Kimi parses a hook's stdout as a decision document.
 $payloadJson | powershell -NoProfile -NonInteractive -File $PeonScript 2>$null | Out-Null

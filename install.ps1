@@ -4232,7 +4232,13 @@ if ((-not $Local) -and $KimiHomeDir) {
         & powershell -NoProfile -NonInteractive -File $kimiAdapterPath -Install | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Kimi Code hooks registered in $(Join-Path $KimiHomeDir 'config.toml')" -ForegroundColor Green
-            Write-Host "  Run 'kimi doctor' to validate, then restart Kimi Code." -ForegroundColor Yellow
+            if ($KimiHomeDir -eq $KimiCodeDir) {
+                Write-Host "  Run 'kimi doctor' to validate, then restart Kimi Code." -ForegroundColor Yellow
+            } else {
+                # kimi-cli has no `kimi doctor`, and no Permission events either;
+                # the adapter left those out and said so.
+                Write-Host "  Restart kimi-cli (1.28.0 or later; earlier versions have no hooks)." -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  Warning: kimi.ps1 -Install exited $LASTEXITCODE; hooks were not registered." -ForegroundColor Yellow
         }
