@@ -97,6 +97,69 @@ info()  { printf "%s>%s %s\n" "$GREEN" "$RESET" "$*"; }
 warn()  { printf "%s!%s %s\n" "$YELLOW" "$RESET" "$*"; }
 error() { printf "%sx%s %s\n" "$RED" "$RESET" "$*" >&2; }
 
+is_watcher_script() {
+  # Whether $1 names this install's adapter. -ef compares inodes, so symlinks
+  # and ../ in either path still match.
+  local candidate
+  for candidate in "$PEON_DIR/adapters/kimi.sh" "$(self_path)"; do
+    if [ "$1" = "$candidate" ] || [ "$1" -ef "$candidate" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_legacy_watcher() {
+  # The watcher was started as `nohup bash "$0"` with no arguments, $0 being
+  # the adapter path its --install was run with. So its argv is exactly
+  # ("bash", <path>), and <path> has to be this install's adapter: a process
+  # that merely mentions kimi or bash -- another script, an editor, a shell
+  # job, a program handed "bash <adapter>" as arguments -- does not qualify.
+  local pid="$1" arg script cwd args comm
+  local -a argv=()
+
+  if [ -r "/proc/$pid/cmdline" ]; then
+    # Linux: read argv as the kernel holds it, NUL-separated, instead of the
+    # space-joined text ps prints, where argument boundaries are lost.
+    while IFS= read -r -d '' arg; do
+      argv+=("$arg")
+    done < "/proc/$pid/cmdline"
+    [ "${#argv[@]}" -eq 2 ] || return 1
+    [ "$(basename -- "${argv[0]}")" = bash ] || return 1
+    # argv[0] is whatever the parent chose; the executable is not.
+    [ "$(basename -- "$(readlink "/proc/$pid/exe" 2>/dev/null)")" = bash ] || return 1
+    script="${argv[1]}"
+    case "$script" in
+      /*) ;;
+      # Started from a relative path: resolve it against the watcher's own
+      # working directory.
+      *) cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || return 1
+         script="$cwd/$script" ;;
+    esac
+    is_watcher_script "$script"
+    return
+  fi
+
+  # Elsewhere (macOS) there is no /proc, and ps only has the joined text. Ask
+  # ps for the executable separately, then demand the joined text be exactly
+  # "<argv0> <adapter path>" for an absolute adapter path. A relative path
+  # cannot be resolved without the process's cwd, so it stays unverified.
+  comm="$(ps -p "$pid" -o comm= 2>/dev/null)" || return 1
+  [ "$(basename -- "$comm")" = bash ] || return 1
+  args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+  case "$args" in
+    *" /"*) ;;
+    *) return 1 ;;
+  esac
+  arg="${args%% /*}"            # argv[0]: everything before the first " /"
+  case "$arg" in
+    bash|*/bash) ;;
+    *) return 1 ;;
+  esac
+  [ "$arg" != "${arg#* }" ] && return 1   # argv[0] itself never had a space
+  is_watcher_script "${args#"$arg" }"
+}
+
 stop_legacy_watcher() {
   # Up to v2.37.0 this adapter was a filesystem watcher daemon. An update only
   # replaces the script on disk, so the old daemon survives it and keeps piping
@@ -115,19 +178,19 @@ stop_legacy_watcher() {
   fi
 
   if [ -f "$LEGACY_PIDFILE" ]; then
-    local pid args
+    local pid
     pid="$(tr -dc '0-9' < "$LEGACY_PIDFILE" 2>/dev/null)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      # A pid outlives the process that wrote it, so only kill one that still
-      # looks like the watcher rather than whatever inherited the number.
-      args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-      case "$args" in
-        *kimi*)
-          pkill -P "$pid" 2>/dev/null || true
-          kill "$pid" 2>/dev/null || true
-          found=1
-          ;;
-      esac
+      # A pid outlives the process that wrote it, so only kill the watcher
+      # itself, never whatever inherited the number.
+      if is_legacy_watcher "$pid"; then
+        pkill -P "$pid" 2>/dev/null || true
+        kill "$pid" 2>/dev/null || true
+        found=1
+      elif ps -p "$pid" -o args= 2>/dev/null | grep -q 'kimi\.sh'; then
+        warn "PID $pid may be the old Kimi watcher, but its script path could not be verified; left it running."
+        warn "If it is, stop it with: kill $pid"
+      fi
     fi
     rm -f "$LEGACY_PIDFILE"
   fi

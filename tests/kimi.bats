@@ -46,17 +46,31 @@ run_kimi_flag() {
   run env HOME="$KIMI_FAKE_HOME" bash "$KIMI_SH" "$1"
 }
 
-# Stand in for the watcher daemon this adapter replaced: a background process
-# whose command line still says "kimi", plus the pidfile it used to hold.
+# Stand in for the watcher daemon this adapter replaced. Up to v2.37.0 its
+# --install ran `nohup bash "$0" &` from $PEON_DIR/adapters/kimi.sh and wrote
+# $! to the pidfile, so start a stub the same way from the same path.
 start_legacy_watcher() {
-  cat > "$TEST_DIR/kimi-watcher-stub.sh" <<'STUB'
-#!/bin/bash
-sleep 30
-STUB
-  chmod +x "$TEST_DIR/kimi-watcher-stub.sh"
-  bash "$TEST_DIR/kimi-watcher-stub.sh" &
+  mkdir -p "$TEST_DIR/adapters"
+  printf '#!/bin/bash\nsleep 30\n' > "$TEST_DIR/adapters/kimi.sh"
+  nohup bash "$TEST_DIR/adapters/kimi.sh" >/dev/null 2>&1 &
   LEGACY_PID=$!
   echo "$LEGACY_PID" > "$LEGACY_PIDFILE"
+}
+
+# Run a script as an unrelated background job whose pid the stale pidfile
+# then points at.
+start_unrelated_job() {
+  printf '#!/bin/bash\nsleep 30\n' > "$1"
+  bash "$1" >/dev/null 2>&1 &
+  UNRELATED_PID=$!
+  echo "$UNRELATED_PID" > "$LEGACY_PIDFILE"
+}
+
+# The pid is still a live process (not reaped, not a zombie).
+pid_is_alive() {
+  local state
+  state="$(ps -p "$1" -o stat= 2>/dev/null | tr -d ' ')"
+  [ -n "$state" ] && [ "${state:0:1}" != "Z" ]
 }
 
 # A killed child sticks around as a zombie until it is waited on, so kill -0
@@ -364,6 +378,80 @@ assert_round_trip() {
   [ ! -f "$LEGACY_PIDFILE" ]
   kill -0 "$unrelated_pid"
   kill "$unrelated_pid" 2>/dev/null || true
+}
+
+@test "a stale pidfile does not kill an unrelated shell job with kimi in its name" {
+  start_unrelated_job "$TEST_DIR/kimi-unrelated-job.sh"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  [ ! -f "$LEGACY_PIDFILE" ]
+  pid_is_alive "$UNRELATED_PID"
+  [[ "$output" != *"Stopped the old Kimi watcher daemon"* ]]
+  kill "$UNRELATED_PID" 2>/dev/null || true
+}
+
+@test "a stale pidfile does not kill a kimi.sh that is not this install's adapter" {
+  mkdir -p "$TEST_DIR/elsewhere"
+  start_unrelated_job "$TEST_DIR/elsewhere/kimi.sh"
+
+  run_kimi_flag --uninstall
+  [ "$status" -eq 0 ]
+  [ ! -f "$LEGACY_PIDFILE" ]
+  pid_is_alive "$UNRELATED_PID"
+  [[ "$output" == *"could not be verified"* ]]
+  kill "$UNRELATED_PID" 2>/dev/null || true
+}
+
+@test "a stale pidfile does not kill the adapter run with arguments" {
+  # Only the watcher ran with no arguments; anything with a flag after the
+  # path is some other invocation that just happens to share the script.
+  mkdir -p "$TEST_DIR/adapters"
+  printf '#!/bin/bash\nsleep 30\n' > "$TEST_DIR/adapters/kimi.sh"
+  bash "$TEST_DIR/adapters/kimi.sh" --status >/dev/null 2>&1 &
+  other_pid=$!
+  echo "$other_pid" > "$LEGACY_PIDFILE"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  pid_is_alive "$other_pid"
+  kill "$other_pid" 2>/dev/null || true
+}
+
+@test "a stale pidfile does not kill a program handed 'bash <adapter>' as arguments" {
+  # ps joins argv with spaces, so "python3 -c ... /usr/bin/bash <adapter>"
+  # contains "/bash <adapter>" even though bash is just an argument here.
+  mkdir -p "$TEST_DIR/adapters"
+  printf '#!/bin/bash\nsleep 30\n' > "$TEST_DIR/adapters/kimi.sh"
+  python3 -c 'import time; time.sleep(30)' /usr/bin/bash "$TEST_DIR/adapters/kimi.sh" &
+  other_pid=$!
+  echo "$other_pid" > "$LEGACY_PIDFILE"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Stopped the old Kimi watcher daemon"* ]]
+  pid_is_alive "$other_pid"
+  kill "$other_pid" 2>/dev/null || true
+}
+
+@test "--install stops a watcher started from a relative adapter path" {
+  # `bash adapters/kimi.sh --install` from a checkout left "bash adapters/kimi.sh"
+  # as the watcher's command line. Resolving it needs /proc/<pid>/cwd.
+  [ -d /proc/self ] || skip "no /proc to resolve the watcher's cwd"
+  mkdir -p "$TEST_DIR/adapters"
+  printf '#!/bin/bash\nsleep 30\n' > "$TEST_DIR/adapters/kimi.sh"
+  cd "$TEST_DIR"
+  nohup bash adapters/kimi.sh >/dev/null 2>&1 &
+  LEGACY_PID=$!
+  cd - >/dev/null
+  echo "$LEGACY_PID" > "$LEGACY_PIDFILE"
+
+  run_kimi_flag --install
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Stopped the old Kimi watcher daemon"* ]]
+  sleep 0.2
+  run pid_is_alive "$LEGACY_PID"
+  [ "$status" -ne 0 ]
 }
 
 @test "the adapter resolves its install dir from its own path" {
