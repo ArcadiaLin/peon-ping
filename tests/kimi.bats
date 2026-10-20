@@ -506,6 +506,20 @@ TOML
   legacy_watcher_is_gone
 }
 
+@test "--stop-watcher stops the watcher daemon and leaves the config alone" {
+  printf 'a = 1\n' > "$KIMI_CONFIG"
+  run_kimi_flag --install
+  cp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  start_legacy_watcher
+
+  run_kimi_flag --stop-watcher
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Stopped the old Kimi watcher daemon"* ]]
+  legacy_watcher_is_gone
+  run cmp "$KIMI_CONFIG" "$TEST_DIR/config.installed"
+  [ "$status" -eq 0 ]
+}
+
 @test "a stale pidfile is cleared without killing whatever reused the pid" {
   # The pid outlives the process that wrote it, so a pid now belonging to
   # something else must be left alone.

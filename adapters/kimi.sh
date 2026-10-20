@@ -292,8 +292,8 @@ warn_unmanaged_hooks() {
   {
     warn "$KIMI_CONFIG has $n hook command(s) outside the peon-ping block that run the Kimi adapter."
     warn "Kimi Code's migration from kimi-cli copies hooks without the block markers, so these"
-    warn "were likely carried over from ~/.kimi: each event they cover plays twice, and"
-    warn "uninstalling peon-ping leaves them behind. Remove those [[hooks]] entries by hand."
+    warn "were likely carried over from ~/.kimi. Alongside the block they can make events fire"
+    warn "twice, and uninstalling peon-ping leaves them behind. Remove those [[hooks]] entries by hand."
   } >&2
 }
 
@@ -329,11 +329,12 @@ strip_block() {
 case "${1:-}" in
   --help|-h)
     cat <<EOF
-Usage: bash kimi.sh [--install|--uninstall|--status]
+Usage: bash kimi.sh [--install|--uninstall|--status|--stop-watcher]
 
   --install      Register peon-ping hooks in $KIMI_CONFIG
   --uninstall    Remove them
   --status       Report whether they are registered
+  --stop-watcher Only stop the watcher daemon this adapter used to be
   (no args)      Hook mode: read one Kimi event as JSON on stdin and forward it
 EOF
     exit 0
@@ -354,6 +355,13 @@ EOF
     warn "peon-ping hooks not registered in $KIMI_CONFIG"
     warn_unmanaged_hooks
     exit 1
+    ;;
+
+  --stop-watcher)
+    # For uninstall.sh, which handles each config itself but still has to reap
+    # a daemon left by an install that never registered hooks.
+    stop_legacy_watcher
+    exit 0
     ;;
 
   --uninstall)

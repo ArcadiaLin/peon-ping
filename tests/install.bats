@@ -1154,6 +1154,63 @@ _kimi_test_teardown() {
   _kimi_test_teardown
 }
 
+# Hooks shaped like Kimi Code's kimi-cli migration output: copied out of
+# ~/.kimi/config.toml with our block markers gone.
+_seed_unmarked_kimi_hooks() {
+  cat > "$1" <<TOML
+model = "kimi-k2"
+
+[[hooks]]
+event = "Stop"
+command = "CLAUDE_PEON_DIR='$INSTALL_DIR' bash '$INSTALL_DIR/adapters/kimi.sh'"
+timeout = 10
+TOML
+}
+
+@test "uninstall warns about unmarked Kimi hooks in a config with no block" {
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code"
+  bash "$CLONE_DIR/install.sh"
+  _seed_unmarked_kimi_hooks "$TEST_HOME/.kimi-code/config.toml"
+  cp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.seeded"
+
+  run bash "$INSTALL_DIR/uninstall.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$TEST_HOME/.kimi-code/config.toml has 1 hook command(s) outside the peon-ping block"* ]]
+  cmp "$TEST_HOME/.kimi-code/config.toml" "$TEST_HOME/kimi.seeded"
+  _kimi_test_teardown
+}
+
+@test "uninstall warns about unmarked Kimi hooks while removing the block elsewhere" {
+  # ~/.kimi-code carries the block; ~/.kimi only the unmarked copy.
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code" "$TEST_HOME/.kimi"
+  bash "$CLONE_DIR/install.sh"
+  grep -qF "# peon-ping Kimi hooks begin" "$TEST_HOME/.kimi-code/config.toml"
+  _seed_unmarked_kimi_hooks "$TEST_HOME/.kimi/config.toml"
+
+  run bash "$INSTALL_DIR/uninstall.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Removed Kimi Code hooks from $TEST_HOME/.kimi-code/config.toml"* ]]
+  [[ "$output" == *"$TEST_HOME/.kimi/config.toml has 1 hook command(s) outside the peon-ping block"* ]]
+  _kimi_test_teardown
+}
+
+@test "uninstall passes on the adapter's warning for unmarked hooks next to the block" {
+  _kimi_test_setup
+  mkdir -p "$TEST_HOME/.kimi-code"
+  _seed_unmarked_kimi_hooks "$TEST_HOME/.kimi-code/config.toml"
+  bash "$CLONE_DIR/install.sh"
+  grep -qF "# peon-ping Kimi hooks begin" "$TEST_HOME/.kimi-code/config.toml"
+
+  run bash "$INSTALL_DIR/uninstall.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"has 1 hook command(s) outside the peon-ping block"* ]]
+  run grep -qF "# peon-ping Kimi hooks begin" "$TEST_HOME/.kimi-code/config.toml"
+  [ "$status" -ne 0 ]
+  _kimi_test_teardown
+}
+
 @test "uninstall stops instead of guessing at the Kimi block when the adapter is gone" {
   _kimi_test_setup
   mkdir -p "$TEST_HOME/.kimi-code"
